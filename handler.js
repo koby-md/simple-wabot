@@ -10,124 +10,445 @@ import {
 import { smsg } from './lib/serialize.js';
 import initDatabase from './lib/database.js';
 import printMsg from './lib/print.js';
+
 import moment from 'moment-timezone';
 import fs from 'fs';
 import util from 'util';
 import chalk from 'chalk';
 
-const isNumber = (x) => typeof x === 'number' && !isNaN(x);
-const delay = (ms) => isNumber(ms) && new Promise((r) => setTimeout(r, ms));
 
 /* ══════════════════════════════════════
-   ALWAYS ONLINE
+   HELPERS
 ══════════════════════════════════════ */
 
-let presenceInterval = null;
+const isNumber = (x) =>
+  typeof x === 'number' && !isNaN(x);
 
-export async function startAlwaysOnline() {
-  // منع تشغيل أكثر من interval
-  if (presenceInterval) return;
+const delay = (ms) =>
+  isNumber(ms) &&
+  new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
 
-  const updatePresence = async () => {
-    try {
-      if (this?.sendPresenceUpdate) {
-        await this.sendPresenceUpdate('available');
-      }
-    } catch (e) {
-      console.error('[Presence Error]', e);
+
+/*
+ * تحويل أي نوع من الأخطاء إلى نص مفهوم.
+ *
+ * يدعم:
+ *
+ * throw 'hello'
+ * throw new Error('hello')
+ * throw { error: 'hello' }
+ * FFmpeg errors
+ * Baileys errors
+ * أخطاء JSON
+ */
+function formatError(error) {
+  try {
+    if (error instanceof Error) {
+      return error.stack ||
+        error.message ||
+        String(error);
     }
-  };
 
-  // إرسال الحالة مباشرة
-  await updatePresence();
-
-  // إعادة إرسال الحالة كل 30 ثانية
-  presenceInterval = setInterval(async () => {
-    try {
-      await updatePresence();
-    } catch (e) {
-      console.error('[Presence Heartbeat Error]', e);
+    if (typeof error === 'string') {
+      return error;
     }
-  }, 30000);
+
+    if (typeof error === 'number' ||
+        typeof error === 'boolean') {
+      return String(error);
+    }
+
+    if (error === null) {
+      return 'null';
+    }
+
+    if (error === undefined) {
+      return 'undefined';
+    }
+
+    try {
+      return JSON.stringify(
+        error,
+        null,
+        2
+      );
+    } catch {
+      return util.format(error);
+    }
+
+  } catch {
+    return String(error);
+  }
 }
+
+
+/*
+ * الحصول على رقم الـ owner مهما كان
+ * شكل global.owner
+ */
+function getOwnerNumber(owner) {
+  const value =
+    Array.isArray(owner)
+      ? owner[0]
+      : owner;
+
+  return String(value || '')
+    .replace(/[^0-9]/g, '');
+}
+
+
+/*
+ * تحويل sender إلى JID عادي.
+ */
+function normalizeSender(conn, sender) {
+  if (!sender) return '';
+
+  try {
+    if (
+      sender.endsWith('@lid')
+    ) {
+      return conn.getJid
+        ? conn.getJid(sender)
+        : conn.decodeJid(sender);
+    }
+
+    return conn.decodeJid
+      ? conn.decodeJid(sender)
+      : sender;
+
+  } catch {
+    return sender;
+  }
+}
+
+
+/*
+ * إرسال تقرير الخطأ إلى Owner.
+ */
+async function reportErrorToOwners(
+  conn,
+  m,
+  errorText
+) {
+  const owners =
+    global.owner || [];
+
+  if (!owners.length) {
+    console.error(
+      '[ERROR REPORT] global.owner is empty'
+    );
+
+    return;
+  }
+
+  const report =
+`*[ BOT ERROR ]*
+
+*Plugin:* ${m?.plugin || 'Unknown'}
+*Command:* ${m?.command || 'Unknown'}
+*From:* ${m?.sender || 'Unknown'}
+*Chat:* ${m?.chat || 'Unknown'}
+
+*Error:*
+
+\`\`\`
+${errorText}
+\`\`\``;
+
+  for (const owner of owners) {
+    try {
+      const number =
+        getOwnerNumber(owner);
+
+      if (!number) continue;
+
+      let ownerJid =
+        `${number}@s.whatsapp.net`;
+
+      /*
+       * محاولة الحصول على JID الصحيح
+       */
+      try {
+        if (
+          typeof conn.onWhatsApp ===
+          'function'
+        ) {
+          const result =
+            await conn.onWhatsApp(
+              number
+            );
+
+          if (
+            result?.[0]?.jid
+          ) {
+            ownerJid =
+              result[0].jid;
+          }
+        }
+      } catch {}
+
+      await conn.sendMessage(
+        ownerJid,
+        {
+          text: report,
+        }
+      );
+
+    } catch (sendError) {
+      console.error(
+        '[ERROR REPORT TO OWNER FAILED]',
+        sendError
+      );
+    }
+  }
+}
+
+
+/*
+ * إرسال الخطأ إلى نفس المحادثة.
+ */
+async function sendErrorToChat(
+  conn,
+  m,
+  errorText
+) {
+  if (!m?.chat) return;
+
+  const text =
+`*[ BOT ERROR ]*
+
+*Plugin:* ${m.plugin || 'Unknown'}
+*Command:* ${m.command || 'Unknown'}
+
+*Error:*
+
+\`\`\`
+${errorText}
+\`\`\``;
+
+  try {
+    await conn.sendMessage(
+      m.chat,
+      {
+        text,
+      },
+      {
+        quoted: m,
+      }
+    );
+
+  } catch (sendError) {
+    console.error(
+      '[ERROR MESSAGE FAILED]',
+      sendError
+    );
+  }
+}
+
+
+/*
+ * إرسال الخطأ إلى Owner + المحادثة.
+ */
+async function handlePluginError(
+  conn,
+  m,
+  error
+) {
+  const errorText =
+    formatError(error);
+
+  console.error(
+    chalk.red(
+      '\n════════ PLUGIN ERROR ════════'
+    )
+  );
+
+  console.error(
+    chalk.red(
+      `Plugin: ${m?.plugin || 'Unknown'}`
+    )
+  );
+
+  console.error(
+    chalk.red(
+      `Command: ${m?.command || 'Unknown'}`
+    )
+  );
+
+  console.error(
+    chalk.red(errorText)
+  );
+
+  console.error(
+    chalk.red(
+      '══════════════════════════════\n'
+    )
+  );
+
+
+  /*
+   * إرسال التفاصيل للـ Owner
+   */
+  await reportErrorToOwners(
+    conn,
+    m,
+    errorText
+  );
+
+
+  /*
+   * إرسال التفاصيل للمحادثة
+   */
+  await sendErrorToChat(
+    conn,
+    m,
+    errorText
+  );
+}
+
 
 /* ══════════════════════════════════════
    MAIN HANDLER
 ══════════════════════════════════════ */
 
 export async function handler(chatUpdate) {
-  if (global.db.data == null) await global.loadDatabase();
 
-  this.msgqueque = this.msgqueque || [];
+  /*
+   * Database
+   */
+  if (
+    global.db.data == null
+  ) {
+    await global.loadDatabase();
+  }
+
+
+  /*
+   * Queue
+   */
+  this.msgqueque =
+    this.msgqueque || [];
+
 
   if (!chatUpdate) return;
 
+
   /*
-   * محاولة إبقاء البوت Online
-   * عند وصول أي Update
+   * Push message
    */
   try {
-    await this.sendPresenceUpdate('available');
-  } catch {}
+    await this.pushMessage(
+      chatUpdate.messages
+    );
+  } catch (e) {
+    console.error(
+      '[pushMessage ERROR]',
+      e
+    );
+  }
 
-  await this.pushMessage(chatUpdate.messages).catch(console.error);
 
-  let m = chatUpdate.messages[chatUpdate.messages.length - 1];
+  let m =
+    chatUpdate.messages?.[
+      chatUpdate.messages.length - 1
+    ];
+
 
   if (!m) return;
-  if (m.key.fromMe) return;
-  if (!m.message) return;
 
-  /* ══════════════════════════════════════
-     FILTER PROTOCOL / REACTION
-  ══════════════════════════════════════ */
 
-  if (m.message.protocolMessage) return;
-  if (m.message.reactionMessage) return;
+  if (m.key?.fromMe) {
+    return;
+  }
 
+
+  if (!m.message) {
+    return;
+  }
+
+
+  /*
+   * تجاهل protocol messages
+   */
+  if (
+    m.message.protocolMessage
+  ) {
+    return;
+  }
+
+
+  /*
+   * تجاهل reaction messages
+   */
+  if (
+    m.message.reactionMessage
+  ) {
+    return;
+  }
+
+
+  /*
+   * تحويل الرسالة إلى smsg
+   */
   try {
-    m = smsg(this, m) || m;
+
+    m =
+      smsg(this, m) || m;
 
     if (!m) return;
+
 
     m.exp = 0;
 
     /*
-     * مهم:
-     * m.limit يبدأ false.
-     * سيتم خصم Limit فقط إذا كان plugin
-     * يحتاج Limit فعلياً.
+     * لا نستخدم limit لمنع الأوامر.
      */
     m.limit = false;
 
-    /* ══════════════════════════════════════
-       INIT DATABASE
-    ══════════════════════════════════════ */
 
+    /*
+     * Database structure
+     */
     try {
       initDatabase(m);
     } catch (e) {
-      console.error('[Database Init Error]', e);
+      console.error(
+        '[Database Init ERROR]',
+        e
+      );
     }
 
-    /* ══════════════════════════════════════
-       MAKE SURE USER EXISTS
-    ══════════════════════════════════════ */
 
-    let senderJid;
+    /* ══════════════════════════════
+       ENSURE USER
+    ══════════════════════════════ */
 
-    try {
-      senderJid = m.sender.endsWith('@lid')
-        ? (this.getJid
-            ? this.getJid(m.sender)
-            : this.decodeJid(m.sender))
-        : this.decodeJid(m.sender);
-    } catch {
-      senderJid = m.sender;
+    let senderJid =
+      normalizeSender(
+        this,
+        m.sender
+      );
+
+
+    if (!senderJid) {
+      senderJid =
+        m.sender;
     }
 
-    if (!global.db.data.users[senderJid]) {
-      global.db.data.users[senderJid] = {
+
+    /*
+     * إنشاء user قبل أي استعمال له.
+     */
+    if (
+      !global.db.data.users[
+        senderJid
+      ]
+    ) {
+      global.db.data.users[
+        senderJid
+      ] = {
         exp: 0,
         limit: 0,
         premium: false,
@@ -142,82 +463,249 @@ export async function handler(chatUpdate) {
       };
     }
 
-    /* ══════════════════════════════════════
+
+    /*
+     * إنشاء chat إذا لم يكن موجوداً.
+     */
+    if (
+      m.chat &&
+      !global.db.data.chats[m.chat]
+    ) {
+      global.db.data.chats[m.chat] = {};
+    }
+
+
+    /* ══════════════════════════════
        ROLES
-    ══════════════════════════════════════ */
+    ══════════════════════════════ */
 
-    const isROwner = [
-      this.decodeJid(global.conn.user.id),
+    const ownerJids = [
+      this.decodeJid(
+        global.conn?.user?.id ||
+        this.user?.id ||
+        ''
+      ),
 
-      ...global.owner.map((a) => {
-        const num = Array.isArray(a) ? a[0] : a;
-        return num.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-      }),
+      ...(global.owner || []).map(
+        (a) => {
+          const num =
+            Array.isArray(a)
+              ? a[0]
+              : a;
 
-      ...global.owner.map((a) => {
-        const num = Array.isArray(a) ? a[0] : a;
-        return num.replace(/[^0-9]/g, '') + '@lid';
-      }),
+          return (
+            String(num)
+              .replace(/[^0-9]/g, '') +
+            '@s.whatsapp.net'
+          );
+        }
+      ),
 
-    ].includes(senderJid);
+      ...(global.owner || []).map(
+        (a) => {
+          const num =
+            Array.isArray(a)
+              ? a[0]
+              : a;
 
-    const isOwner = isROwner || m.fromMe;
+          return (
+            String(num)
+              .replace(/[^0-9]/g, '') +
+            '@lid'
+          );
+        }
+      ),
+    ].filter(Boolean);
+
+
+    /*
+     * owner detection
+     *
+     * نفحص sender الأصلي
+     * وكذلك sender بعد التحويل.
+     */
+    const rawSender =
+      String(m.sender || '');
+
+    const decodedSender =
+      normalizeSender(
+        this,
+        rawSender
+      );
+
+
+    const isROwner =
+      ownerJids.includes(
+        rawSender
+      ) ||
+      ownerJids.includes(
+        decodedSender
+      );
+
+
+    const isOwner =
+      isROwner ||
+      m.fromMe;
+
+
+    const userData =
+      global.db.data.users[
+        senderJid
+      ];
+
 
     const isMods =
-      global.db.data.users[senderJid]?.moderator || false;
+      userData?.moderator ||
+      false;
+
 
     const isPrems =
-      global.db.data.users[senderJid]?.premium || false;
+      userData?.premium ||
+      false;
+
 
     const isBans =
-      global.db.data.users[senderJid]?.banned || false;
+      userData?.banned ||
+      false;
+
 
     const isWhitelist =
-      global.db.data.chats[m.chat]?.whitelist || false;
+      global.db.data.chats?.[
+        m.chat
+      ]?.whitelist ||
+      false;
 
-    /* ══════════════════════════════════════
+
+    /* ══════════════════════════════
+       ALWAYS ONLINE
+    ══════════════════════════════ */
+
+    /*
+     * إبقاء البوت Available.
+     */
+    try {
+      if (
+        typeof this.sendPresenceUpdate ===
+        'function'
+      ) {
+        await this.sendPresenceUpdate(
+          'available'
+        );
+      }
+    } catch (e) {
+      console.error(
+        '[Presence ERROR]',
+        e
+      );
+    }
+
+
+    /* ══════════════════════════════
+       ALWAYS READ
+    ══════════════════════════════ */
+
+    /*
+     * اقرأ الرسالة في الخاص والمجموعات.
+     *
+     * لا يوجد شرط m.isGroup هنا.
+     */
+    try {
+
+      if (
+        global.opts?.autoread !== false &&
+        typeof this.readMessages ===
+        'function'
+      ) {
+        await this.readMessages([
+          m.key
+        ]);
+      }
+
+    } catch (e) {
+
+      console.error(
+        '[AutoRead ERROR]',
+        e
+      );
+    }
+
+
+    /* ══════════════════════════════
        GROUP METADATA
-    ══════════════════════════════════════ */
+    ══════════════════════════════ */
 
     if (m.isGroup) {
+
       try {
-        const meta = await this.groupMetadata(m.chat);
 
-        const members = meta.participants.map((a) => a.id);
+        const meta =
+          await this.groupMetadata(
+            m.chat
+          );
 
-        if (!global.db.data.chats[m.chat]) {
-          global.db.data.chats[m.chat] = {};
+        const members =
+          meta.participants.map(
+            (a) => a.id
+          );
+
+        if (
+          global.db.data.chats[
+            m.chat
+          ]
+        ) {
+
+          global.db.data.chats[
+            m.chat
+          ].member = members;
+
+          global.db.data.chats[
+            m.chat
+          ].chat =
+            (
+              global.db.data.chats[
+                m.chat
+              ].chat || 0
+            ) + 1;
         }
-
-        global.db.data.chats[m.chat].member = members;
-
-        global.db.data.chats[m.chat].chat =
-          (global.db.data.chats[m.chat].chat || 0) + 1;
 
       } catch {}
     }
 
-    /* ══════════════════════════════════════
-       AUTO OWNER PERMISSIONS
-    ══════════════════════════════════════ */
+
+    /* ══════════════════════════════
+       OWNER PERMISSIONS
+    ══════════════════════════════ */
 
     if (isROwner) {
-      global.db.data.users[senderJid].premium = true;
-      global.db.data.users[senderJid].premiumDate = 'PERMANENT';
-      global.db.data.users[senderJid].limit = 'PERMANENT';
-      global.db.data.users[senderJid].moderator = true;
+
+      userData.premium =
+        true;
+
+      userData.premiumDate =
+        'PERMANENT';
+
+      userData.limit =
+        'PERMANENT';
+
+      userData.moderator =
+        true;
 
     } else if (isPrems) {
 
-      global.db.data.users[senderJid].limit = 'PERMANENT';
+      userData.limit =
+        'PERMANENT';
 
-    } else if (isBans) {
+    } else if (
+      !isROwner &&
+      isBans
+    ) {
       return;
     }
 
-    /* ══════════════════════════════════════
-       SELF / GROUP ONLY
-    ══════════════════════════════════════ */
+
+    /* ══════════════════════════════
+       GLOBAL GUARDS
+    ══════════════════════════════ */
 
     if (
       global.selfMode &&
@@ -229,6 +717,7 @@ export async function handler(chatUpdate) {
       return;
     }
 
+
     if (
       global.gconly &&
       !m.isGroup &&
@@ -237,217 +726,354 @@ export async function handler(chatUpdate) {
       return;
     }
 
-    /* ══════════════════════════════════════
+
+    /* ══════════════════════════════
        QUEUE
-    ══════════════════════════════════════ */
+    ══════════════════════════════ */
 
     if (
       global.opts?.queque &&
       m.text &&
       !(isMods || isPrems)
     ) {
-      const queque = this.msgqueque;
 
-      const prev = queque[queque.length - 1];
+      const queque =
+        this.msgqueque;
 
-      queque.push(m.id || m.key.id);
+      const prev =
+        queque[
+          queque.length - 1
+        ];
 
-      const t = setInterval(async () => {
-        if (!queque.includes(prev)) {
-          clearInterval(t);
-        } else {
-          await delay(1000 * 5);
-        }
-      }, 1000 * 5);
+      const messageId =
+        m.id ||
+        m.key?.id;
+
+      queque.push(
+        messageId
+      );
+
+      const t =
+        setInterval(
+          async () => {
+
+            if (
+              !queque.includes(
+                prev
+              )
+            ) {
+              clearInterval(t);
+            } else {
+              await delay(
+                5000
+              );
+            }
+
+          },
+          5000
+        );
     }
 
-    /* ══════════════════════════════════════
-       ALWAYS ONLINE
-    ══════════════════════════════════════ */
 
-    try {
-      await this.sendPresenceUpdate('available');
-    } catch {}
+    /* ══════════════════════════════
+       USER STATS
+    ══════════════════════════════ */
 
-    /* ══════════════════════════════════════
-       ALWAYS READ MESSAGE
-    ══════════════════════════════════════ */
+    userData.online =
+      Date.now();
 
-    try {
-      await this.readMessages([m.key]);
-    } catch (e) {
-      console.error('[AutoRead Error]', e);
-    }
+    userData.chat =
+      (userData.chat || 0) + 1;
+
 
     /*
-     * لا تستخدم global.opts.autoread هنا.
-     * القراءة مفعلة دائماً.
+     * لا nyimak حتى لا يمنع autoread.
      */
-
-    if (global.opts?.nyimak) return;
-
-    if (typeof m.text !== 'string') {
+    if (
+      typeof m.text !==
+      'string'
+    ) {
       m.text = '';
     }
 
-    if (m.isBaileys) return;
 
-    m.exp += Math.ceil(Math.random() * 1000);
+    if (m.isBaileys) {
+      return;
+    }
 
-    /* ══════════════════════════════════════
-       PLUGIN LOOP
-    ══════════════════════════════════════ */
+
+    /*
+     * XP
+     */
+    m.exp +=
+      Math.ceil(
+        Math.random() * 1000
+      );
+
+
+    /* ══════════════════════════════
+       PLUGIN DATA
+    ══════════════════════════════ */
 
     let usedPrefix;
 
-    const _user = global.db.data.users[senderJid];
+    const _user =
+      global.db.data.users[
+        senderJid
+      ];
 
-    const groupMetadata = (
+
+    const groupMetadata =
       m.isGroup
         ? (
-            (global.store?.groupMetadata?.[m.chat]) ||
-            (await this.groupMetadata(m.chat).catch(() => null)) ||
+            global.store
+              ?.groupMetadata
+              ?.[
+                m.chat
+              ] ||
+            await this
+              .groupMetadata(
+                m.chat
+              )
+              .catch(() => null) ||
             {}
           )
-        : {}
-    ) || {};
+        : {};
+
 
     const participants =
-      (m.isGroup
-        ? groupMetadata.participants
-        : []) || [];
+      m.isGroup
+        ? (
+            groupMetadata
+              .participants ||
+            []
+          )
+        : [];
 
-    /* ══════════════════════════════════════
-       USER / BOT PARTICIPANT
-    ══════════════════════════════════════ */
 
+    /*
+     * JID المستخدم.
+     */
     const userJid =
       this.getJid
         ? this.getJid(m.sender)
         : senderJid;
 
+
+    /*
+     * Find group user.
+     */
     const user =
-      (
-        m.isGroup
-          ? participants.find((u) => {
+      m.isGroup
+        ? (
+            participants.find(
+              (u) => {
 
-              const decodedId =
-                this.decodeJid(u.id);
+                const decodedId =
+                  this.decodeJid(
+                    u.id
+                  );
 
-              const decodedPhone =
-                this.decodeJid(u.phoneNumber || '');
+                const decodedPhone =
+                  this.decodeJid(
+                    u.phoneNumber ||
+                    ''
+                  );
 
-              return (
-                decodedId === userJid ||
-                decodedPhone === userJid
-              );
+                return (
+                  decodedId ===
+                    userJid ||
+                  decodedPhone ===
+                    userJid
+                );
+              }
+            ) || {}
+          )
+        : {};
 
-            })
-          : {}
-      ) || {};
 
+    /*
+     * Find bot.
+     */
     const bot =
-      (
-        m.isGroup
-          ? participants.find((u) => {
+      m.isGroup
+        ? (
+            participants.find(
+              (u) => {
 
-              const decodedId =
-                this.decodeJid(u.id);
+                const decodedId =
+                  this.decodeJid(
+                    u.id
+                  );
 
-              const decodedPhone =
-                this.decodeJid(u.phoneNumber || '');
+                const decodedPhone =
+                  this.decodeJid(
+                    u.phoneNumber ||
+                    ''
+                  );
 
-              const botJid =
-                this.decodeJid(this.user?.id);
+                const botJid =
+                  this.decodeJid(
+                    this.user?.id ||
+                    ''
+                  );
 
-              return (
-                decodedId === botJid ||
-                decodedPhone === botJid
-              );
+                return (
+                  decodedId ===
+                    botJid ||
+                  decodedPhone ===
+                    botJid
+                );
+              }
+            ) || {}
+          )
+        : {};
 
-            })
-          : {}
-      ) || {};
 
     const isRAdmin =
-      user?.admin === 'superadmin' || false;
+      user?.admin ===
+        'superadmin' ||
+      false;
+
 
     const isAdmin =
       isRAdmin ||
-      user?.admin === 'admin' ||
+      user?.admin ===
+        'admin' ||
       false;
+
 
     const isBotAdmin =
       !!bot?.admin;
 
-    /* ══════════════════════════════════════
-       UPDATE STORE
-    ══════════════════════════════════════ */
 
+    /*
+     * Store metadata
+     */
     if (
       m.isGroup &&
       groupMetadata.id
     ) {
-      global.store.groupMetadata[m.chat] =
+
+      if (!global.store) {
+        global.store = {};
+      }
+
+      if (!global.store.groupMetadata) {
+        global.store.groupMetadata =
+          {};
+      }
+
+      global.store.groupMetadata[
+        m.chat
+      ] =
         groupMetadata;
     }
 
-    /* ══════════════════════════════════════
-       PLUGINS
-    ══════════════════════════════════════ */
 
-    for (const name in global.plugins) {
+    /* ══════════════════════════════
+       PLUGIN LOOP
+    ══════════════════════════════ */
 
-      let plugin = global.plugins[name];
+    for (
+      const name in global.plugins
+    ) {
+
+      const plugin =
+        global.plugins[name];
+
 
       if (!plugin) continue;
-      if (plugin.disabled) continue;
 
-      /* ── plugin.all() ─────────────── */
+      if (plugin.disabled) {
+        continue;
+      }
 
-      if (typeof plugin.all === 'function') {
+
+      /* ═══════════════════════════
+         ALL HOOK
+      ═══════════════════════════ */
+
+      if (
+        typeof plugin.all ===
+        'function'
+      ) {
+
         try {
+
           await plugin.all.call(
             this,
             m,
             chatUpdate
           );
+
         } catch (e) {
-          console.error(e);
+
+          /*
+           * حتى أخطاء all()
+           * يتم إرسالها.
+           */
+          m.plugin =
+            name;
+
+          await handlePluginError(
+            this,
+            m,
+            e
+          );
         }
       }
 
-      /* ══════════════════════════════════════
-         PREFIX
-      ══════════════════════════════════════ */
 
-      const str2Regex = (str) =>
-        str.replace(
-          /[|\\{}()[\]^$+*?.]/g,
-          '\\$&'
-        );
+      /* ═══════════════════════════
+         PREFIX
+      ═══════════════════════════ */
+
+      const str2Regex =
+        (str) =>
+          String(str)
+            .replace(
+              /[|\\{}()[\]^$+*?.]/g,
+              '\\$&'
+            );
+
 
       const _prefix =
         plugin.customPrefix
           ? plugin.customPrefix
           : this.prefix
-          ? this.prefix
-          : global.prefix;
+            ? this.prefix
+            : global.prefix;
 
-      const match = (
 
+      let prefixMatches;
+
+
+      if (
         _prefix instanceof RegExp
+      ) {
 
-          ? [
-              [
-                _prefix.exec(m.text),
-                _prefix
-              ]
-            ]
+        /*
+         * reset regex state
+         */
+        _prefix.lastIndex = 0;
 
-          : Array.isArray(_prefix)
+        prefixMatches = [
+          [
+            _prefix.exec(
+              m.text
+            ),
+            _prefix
+          ]
+        ];
 
-          ? _prefix.map((p) => {
+      } else if (
+        Array.isArray(_prefix)
+      ) {
+
+        prefixMatches =
+          _prefix.map(
+            (p) => {
 
               const re =
                 p instanceof RegExp
@@ -456,90 +1082,146 @@ export async function handler(chatUpdate) {
                       str2Regex(p)
                     );
 
+              re.lastIndex = 0;
+
               return [
                 re.exec(m.text),
                 re
               ];
+            }
+          );
 
-            })
+      } else if (
+        typeof _prefix ===
+        'string'
+      ) {
 
-          : typeof _prefix === 'string'
+        const re =
+          new RegExp(
+            str2Regex(_prefix)
+          );
 
-          ? [
-              [
-                new RegExp(
-                  str2Regex(_prefix)
-                ).exec(m.text),
+        prefixMatches = [
+          [
+            re.exec(m.text),
+            re
+          ]
+        ];
 
-                new RegExp(
-                  str2Regex(_prefix)
-                )
-              ]
-            ]
+      } else {
 
-          : [
-              [
-                [],
-                new RegExp()
-              ]
-            ]
+        prefixMatches = [
+          [
+            [],
+            new RegExp()
+          ]
+        ];
+      }
 
-      ).find((p) => p[1]);
 
-      /* ══════════════════════════════════════
+      const match =
+        prefixMatches.find(
+          (p) => p[0]
+        );
+
+
+      /* ═══════════════════════════
          BEFORE
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
-      if (typeof plugin.before === 'function') {
+      if (
+        typeof plugin.before ===
+        'function'
+      ) {
 
-        if (
-          await plugin.before.call(
+        try {
+
+          const beforeResult =
+            await plugin.before.call(
+              this,
+              m,
+              {
+                match,
+                conn: this,
+                participants,
+                groupMetadata,
+                user,
+                bot,
+                isROwner,
+                isOwner,
+                isRAdmin,
+                isAdmin,
+                isBotAdmin,
+                isPrems,
+                isBans,
+                chatUpdate,
+              }
+            );
+
+
+          if (
+            beforeResult
+          ) {
+            continue;
+          }
+
+        } catch (e) {
+
+          m.plugin =
+            name;
+
+          await handlePluginError(
             this,
             m,
-            {
-              match,
-              conn: this,
-              participants,
-              groupMetadata,
-              user,
-              bot,
-              isROwner,
-              isOwner,
-              isRAdmin,
-              isAdmin,
-              isBotAdmin,
-              isPrems,
-              isBans,
-              chatUpdate,
-            }
-          )
-        ) {
+            e
+          );
+
           continue;
         }
       }
 
-      if (typeof plugin !== 'function') continue;
 
-      if (!match) continue;
+      if (
+        typeof plugin !==
+        'function'
+      ) {
+        continue;
+      }
+
+
+      if (!match) {
+        continue;
+      }
+
+
+      /* ═══════════════════════════
+         PREFIX RESULT
+      ═══════════════════════════ */
 
       const result =
         (
-          (global.opts?.multiprefix ?? true) &&
+          (global.opts?.multiprefix ??
+            true) &&
           (match[0] || '')[0]
         ) ||
         (
-          (global.opts?.noprefix ?? false)
-            ? null
-            : (match[0] || '')[0]
-        );
+          global.opts?.noprefix ??
+          false
+        )
+          ? null
+          : (match[0] || '')[0];
 
-      usedPrefix = result;
 
-      /* ══════════════════════════════════════
+      usedPrefix =
+        result;
+
+
+      /* ═══════════════════════════
          NO PREFIX
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
       let noPrefix;
+
 
       if (isOwner) {
 
@@ -556,15 +1238,14 @@ export async function handler(chatUpdate) {
         noPrefix =
           !result
             ? ''
-            : m.text.replace(
-                result,
-                ''
-              ).trim();
+            : m.text
+                .replace(
+                  result,
+                  ''
+                )
+                .trim();
       }
 
-      /* ══════════════════════════════════════
-         COMMAND
-      ══════════════════════════════════════ */
 
       let [
         command,
@@ -575,7 +1256,10 @@ export async function handler(chatUpdate) {
           .split(/\s+/)
           .filter(Boolean);
 
-      args = args || [];
+
+      args =
+        args || [];
+
 
       const _args =
         noPrefix
@@ -583,63 +1267,128 @@ export async function handler(chatUpdate) {
           .split(/\s+/)
           .slice(1);
 
+
       const text =
         _args.join(' ');
 
+
       command =
-        (command || '')
-          .toLowerCase();
+        (
+          command || ''
+        ).toLowerCase();
+
 
       const fail =
         plugin.fail ||
         global.dfail;
 
+
+      /* ═══════════════════════════
+         ACCEPT COMMAND
+      ═══════════════════════════ */
+
       const prefixCommand =
         !result
-          ? plugin.customPrefix ||
-            plugin.command
+          ? (
+              plugin.customPrefix ||
+              plugin.command
+            )
           : plugin.command;
 
-      const isAccept =
-        (
-          prefixCommand instanceof RegExp &&
-          prefixCommand.test(command)
-        ) ||
 
-        (
-          Array.isArray(prefixCommand) &&
-          prefixCommand.some((c) =>
-            c instanceof RegExp
-              ? c.test(command)
-              : c === command
-          )
-        ) ||
+      let isAccept = false;
 
-        (
-          typeof prefixCommand === 'string' &&
-          prefixCommand === command
-        );
 
-      m.prefix = !!result;
+      if (
+        prefixCommand instanceof
+        RegExp
+      ) {
+
+        prefixCommand.lastIndex = 0;
+
+        isAccept =
+          prefixCommand.test(
+            command
+          );
+
+      } else if (
+        Array.isArray(
+          prefixCommand
+        )
+      ) {
+
+        isAccept =
+          prefixCommand.some(
+            (c) => {
+
+              if (
+                c instanceof RegExp
+              ) {
+
+                c.lastIndex = 0;
+
+                return c.test(
+                  command
+                );
+              }
+
+              return c ===
+                command;
+            }
+          );
+
+      } else if (
+        typeof prefixCommand ===
+        'string'
+      ) {
+
+        isAccept =
+          prefixCommand ===
+          command;
+      }
+
+
+      m.prefix =
+        !!result;
+
 
       usedPrefix =
         !result
           ? ''
           : result;
 
-      if (!isAccept) continue;
 
-      m.plugin = name;
-      m.chatUpdate = chatUpdate;
-      m.command = command;
-      m.isCommand = true;
+      if (!isAccept) {
+        continue;
+      }
 
-      /* ══════════════════════════════════════
-         CHAT BAN / MUTE
-      ══════════════════════════════════════ */
+
+      /* ═══════════════════════════
+         MESSAGE DATA
+      ═══════════════════════════ */
+
+      m.plugin =
+        name;
+
+      m.chatUpdate =
+        chatUpdate;
+
+      m.command =
+        command;
+
+      m.isCommand =
+        true;
+
+
+      /* ═══════════════════════════
+         CHAT GUARDS
+      ═══════════════════════════ */
 
       const chatData =
-        global.db.data.chats[m.chat];
+        global.db.data.chats[
+          m.chat
+        ];
+
 
       if (
         chatData?.isBanned &&
@@ -647,6 +1396,7 @@ export async function handler(chatUpdate) {
       ) {
         return;
       }
+
 
       if (
         chatData?.mute &&
@@ -656,14 +1406,17 @@ export async function handler(chatUpdate) {
         return;
       }
 
-      /* ══════════════════════════════════════
+
+      /* ═══════════════════════════
          BLOCK COMMAND
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
       if (
-        global.db.data.settings?.blockcmd
+        global.db.data.settings
+          ?.blockcmd
           ?.includes(command)
       ) {
+
         await global.dfail(
           'block',
           m,
@@ -673,147 +1426,178 @@ export async function handler(chatUpdate) {
         continue;
       }
 
-      /* ══════════════════════════════════════
+
+      /* ═══════════════════════════
          PERMISSIONS
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
       if (
         plugin.rowner &&
         !isROwner
       ) {
+
         await fail(
           'rowner',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.owner &&
         !isOwner
       ) {
+
         await fail(
           'owner',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.mods &&
         !isMods
       ) {
+
         await fail(
           'mods',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.premium &&
         !isPrems
       ) {
+
         await fail(
           'premium',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.group &&
         !m.isGroup
       ) {
+
         await fail(
           'group',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.botAdmin &&
         !isBotAdmin
       ) {
+
         await fail(
           'botAdmin',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.admin &&
         !isAdmin
       ) {
+
         await fail(
           'admin',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.private &&
         m.isGroup
       ) {
+
         await fail(
           'private',
           m,
           this
         );
+
         continue;
       }
+
 
       if (
         plugin.register &&
         !_user.registered
       ) {
+
         await fail(
           'unreg',
           m,
           this
         );
+
         continue;
       }
 
-      /* ══════════════════════════════════════
-         LIMIT CHECK DISABLED
-      ══════════════════════════════════════ */
+
+      /* ═══════════════════════════
+         LIMIT
+      ═══════════════════════════ */
 
       /*
-       * تم حذف فحص:
+       * تم حذف:
        *
-       * if (_user.limit < 1) ...
+       * if (_user.limit < 1)
        *
-       * لذلك لن تظهر رسالة:
+       * لذلك لن تظهر:
        *
        * [ LIMIT HABIS ]
        *
-       * ولن يتم منع الأوامر بسبب انتهاء Limit.
+       * ولن يتم منع المستخدم بسبب limit.
        */
 
-      /* ══════════════════════════════════════
-         LEVEL CHECK
-      ══════════════════════════════════════ */
+
+      /* ═══════════════════════════
+         LEVEL
+      ═══════════════════════════ */
 
       if (
         plugin.level &&
-        plugin.level > _user.level
+        plugin.level >
+          (_user.level || 0)
       ) {
 
         await this.reply(
           m.chat,
 
-          `*[ LEVEL KURANG ]*\n> Butuh level *${plugin.level}* untuk menggunakan fitur ini.`,
+          `*[ LEVEL KURANG ]*
+> Butuh level *${plugin.level}* untuk menggunakan fitur ini.`,
 
           m
         );
@@ -821,25 +1605,44 @@ export async function handler(chatUpdate) {
         continue;
       }
 
-      /* ══════════════════════════════════════
-         STAT TRACKER
-      ══════════════════════════════════════ */
 
-      const now = Date.now();
+      /* ═══════════════════════════
+         STAT
+      ═══════════════════════════ */
+
+      if (
+        !global.db.data.respon
+      ) {
+        global.db.data.respon =
+          {};
+      }
+
+
+      const now =
+        Date.now();
+
 
       const stat =
-        global.db.data.respon[m.command];
+        global.db.data.respon[
+          m.command
+        ];
+
 
       if (stat) {
 
         stat.total =
-          (stat.total || 0) + 1;
+          (
+            stat.total || 0
+          ) + 1;
 
-        stat.last = now;
+        stat.last =
+          now;
 
       } else {
 
-        global.db.data.respon[m.command] = {
+        global.db.data.respon[
+          m.command
+        ] = {
           total: 1,
           success: 0,
           last: now,
@@ -847,49 +1650,76 @@ export async function handler(chatUpdate) {
         };
       }
 
+
+      /* ═══════════════════════════
+         XP
+      ═══════════════════════════ */
+
       const xp =
         'exp' in plugin
-          ? parseInt(plugin.exp)
+          ? parseInt(
+              plugin.exp
+            )
           : 17;
 
-      m.exp += xp;
 
-      /* ══════════════════════════════════════
+      m.exp +=
+        isNaN(xp)
+          ? 17
+          : xp;
+
+
+      /* ═══════════════════════════
          EXTRA
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
       const extra = {
+
         match,
+
         usedPrefix,
+
         noPrefix,
+
         _args,
+
         args,
+
         command,
+
         text,
 
         conn: this,
 
         participants,
+
         groupMetadata,
 
         user,
+
         bot,
 
         isROwner,
+
         isOwner,
+
         isRAdmin,
+
         isAdmin,
+
         isBotAdmin,
 
         isPrems,
+
         isBans,
 
         chatUpdate,
       };
 
-      /* ══════════════════════════════════════
+
+      /* ═══════════════════════════
          EXECUTE PLUGIN
-      ══════════════════════════════════════ */
+      ═══════════════════════════ */
 
       try {
 
@@ -899,103 +1729,70 @@ export async function handler(chatUpdate) {
           extra
         );
 
-        /*
-         * هنا يتم تحديد هل يجب خصم Limit.
-         *
-         * إذا كان المستخدم Premium
-         * فلن يتم الخصم.
-         *
-         * إذا كان Plugin يستخدم:
-         *
-         * plugin.limit = true
-         *
-         * سيتم الخصم في النهاية.
-         */
 
+        /*
+         * limit لا يزال محفوظاً
+         * للـ statistics فقط،
+         * لكنه لا يمنع التنفيذ.
+         */
         if (!isPrems) {
+
           m.limit =
             m.limit ||
             plugin.limit ||
-            true;
+            false;
         }
 
+
         const s =
-          global.db.data.respon[m.command];
+          global.db.data.respon[
+            m.command
+          ];
 
-        s.success =
-          (s.success || 0) + 1;
 
-        s.lastSuccess = now;
+        if (s) {
+
+          s.success =
+            (
+              s.success || 0
+            ) + 1;
+
+          s.lastSuccess =
+            now;
+        }
+
 
       } catch (e) {
 
-        m.error = e;
+        /*
+         * أهم جزء في النظام.
+         *
+         * أي خطأ من أي Plugin
+         * يصل هنا.
+         */
 
-        console.error(
-          chalk.red('[Plugin Error]'),
+        m.error =
+          e;
+
+
+        await handlePluginError(
+          this,
+          m,
           e
         );
 
-        if (e && e.name) {
-
-          const errText =
-            util.format(e);
-
-          for (
-            const owner of global.owner
-          ) {
-
-            try {
-
-              const ownerNum =
-                Array.isArray(owner)
-                  ? owner[0]
-                  : owner;
-
-              const cleanNumber =
-                ownerNum
-                  .replace(
-                    /[^0-9]/g,
-                    ''
-                  );
-
-              const data =
-                (
-                  await this.onWhatsApp(
-                    cleanNumber +
-                    '@s.whatsapp.net'
-                  )
-                )[0] || {};
-
-              if (data.exists) {
-
-                await this.reply(
-                  data.jid,
-
-                  `*[ REPORT ERROR ]*\n*Plugin:* ${m.plugin}\n*From:* @${m.sender.split('@')[0]}\n*Chat:* ${m.chat}\n*Cmd:* ${usedPrefix + command}\n\n\`\`\`${errText}\`\`\``,
-
-                  global.fkontak
-                );
-              }
-
-            } catch (ownerError) {
-
-              console.error(
-                '[Owner Error Report]',
-                ownerError
-              );
-            }
-          }
-
-          await m.reply(
-            '*[ Sistem ]* Terjadi error pada bot!'
-          );
-        }
 
       } finally {
 
+        /*
+         * after()
+         *
+         * حتى لو after نفسه فيه خطأ
+         * نرسل الخطأ أيضاً.
+         */
         if (
-          typeof plugin.after === 'function'
+          typeof plugin.after ===
+          'function'
         ) {
 
           try {
@@ -1008,27 +1805,70 @@ export async function handler(chatUpdate) {
 
           } catch (e) {
 
-            console.error(e);
+            m.plugin =
+              name;
 
+            await handlePluginError(
+              this,
+              m,
+              e
+            );
           }
         }
       }
 
+
+      /*
+       * لا تشغل Plugins أخرى
+       * لنفس الرسالة.
+       */
       break;
     }
 
+
   } catch (e) {
 
+    /*
+     * أخطاء handler نفسه.
+     */
+
     console.error(
-      chalk.red('[Handler Error]'),
+      chalk.red(
+        '[HANDLER ERROR]'
+      ),
       e
     );
 
+
+    /*
+     * إذا كانت الرسالة موجودة
+     * أرسل الخطأ أيضاً.
+     */
+    if (m) {
+
+      try {
+
+        await handlePluginError(
+          this,
+          m,
+          e
+        );
+
+      } catch (reportError) {
+
+        console.error(
+          '[Handler Error Report Failed]',
+          reportError
+        );
+      }
+    }
+
+
   } finally {
 
-    /* ══════════════════════════════════════
-       REMOVE QUEUE
-    ══════════════════════════════════════ */
+    /* ══════════════════════════════
+       QUEUE CLEANUP
+    ══════════════════════════════ */
 
     if (
       global.opts?.queque &&
@@ -1041,7 +1881,9 @@ export async function handler(chatUpdate) {
           m.key?.id
         );
 
+
       if (idx !== -1) {
+
         this.msgqueque.splice(
           idx,
           1
@@ -1049,83 +1891,89 @@ export async function handler(chatUpdate) {
       }
     }
 
-    /* ══════════════════════════════════════
+
+    /* ══════════════════════════════
        EXP / LIMIT UPDATE
-    ══════════════════════════════════════ */
+    ══════════════════════════════ */
 
     if (m) {
 
       try {
 
         const finalSenderJid =
-          m.sender.endsWith('@lid')
+          normalizeSender(
+            this,
+            m.sender
+          );
 
-            ? (
-                this.getJid
-                  ? this.getJid(m.sender)
-                  : this.decodeJid(m.sender)
-              )
-
-            : this.decodeJid(
-                m.sender
-              );
 
         const u =
           global.db.data.users[
             finalSenderJid
           ];
 
+
         if (u) {
 
-          u.exp +=
-            m.exp || 0;
+          u.exp =
+            (
+              Number(u.exp) || 0
+            ) +
+            (
+              Number(m.exp) || 0
+            );
+
 
           /*
-           * إذا كان m.limit = true
-           * يتم خصم 1.
+           * لا تخصم limit إذا كان
+           * PERMANENT.
            *
-           * لا يوجد أي فحص يمنع المستخدم
-           * من تشغيل الأمر عند وصوله إلى 0.
+           * ويمكنك حذف هذا الجزء
+           * بالكامل إذا كنت لا تريد
+           * استعمال نظام limits نهائياً.
            */
-
           if (
             m.limit &&
-            typeof u.limit === 'number'
+            typeof u.limit ===
+            'number'
           ) {
-            u.limit -= 1;
 
-            /*
-             * لا نسمح للـ limit بالنزول
-             * إلى أرقام سالبة.
-             */
-            if (u.limit < 0) {
-              u.limit = 0;
-            }
+            u.limit =
+              Math.max(
+                0,
+                u.limit - 1
+              );
           }
         }
 
       } catch (e) {
 
         console.error(
-          '[Handler] Error updating user data:',
+          '[Handler User Update ERROR]',
           e
         );
       }
     }
 
-    /* ══════════════════════════════════════
-       PRINT MESSAGE
-    ══════════════════════════════════════ */
+
+    /* ══════════════════════════════
+       PRINT
+    ══════════════════════════════ */
 
     try {
-      printMsg(m, this);
+
+      printMsg(
+        m,
+        this
+      );
+
     } catch {}
   }
 }
 
+
 /* ══════════════════════════════════════
    PARTICIPANTS UPDATE
-   WELCOME / BYE
 ══════════════════════════════════════ */
 
 export async function participantsUpdate({
@@ -1134,166 +1982,296 @@ export async function participantsUpdate({
   action
 }) {
 
-  if (global.db.data == null) {
+  if (
+    global.db.data == null
+  ) {
     await global.loadDatabase();
   }
 
+
   const chat =
-    global.db.data.chats[id] || {};
+    global.db.data.chats[
+      id
+    ] || {};
+
 
   switch (action) {
 
-    /* ══════════════════════════════════════
+    /* ═══════════════════════════
        ADD / REMOVE
-    ══════════════════════════════════════ */
+    ═══════════════════════════ */
 
     case 'add':
     case 'remove': {
 
-      if (chat.welcome === false) {
+      if (
+        chat.welcome === false
+      ) {
         return;
       }
 
+
       let meta;
+
 
       try {
 
         meta =
-          await this.groupMetadata(id);
+          await this.groupMetadata(
+            id
+          );
 
       } catch (e) {
 
+        console.error(
+          '[Welcome Metadata ERROR]',
+          e
+        );
+
         break;
       }
+
 
       for (
         const user of participants
       ) {
 
-        /*
-         * Event يمكن أن يرجع:
-         *
-         * { id: '...@lid',
-         *   phoneNumber: '...@s.whatsapp.net' }
-         */
-
-        const rawId =
-          user?.phoneNumber ||
-          user?.id ||
-          user;
-
-        let userJid;
-
         try {
 
-          userJid =
+          /*
+           * WhatsApp يمكن أن يعيد:
+           *
+           * { id, phoneNumber }
+           *
+           * لذلك نعطي phoneNumber
+           * الأولوية.
+           */
+
+          const rawId =
+            user?.phoneNumber ||
+            user?.id ||
+            user;
+
+
+          let userJid =
             this.getJid
-              ? this.getJid(rawId)
-              : this.decodeJid(rawId);
+              ? this.getJid(
+                  rawId
+                )
+              : this.decodeJid(
+                  rawId
+                );
 
-        } catch {
 
-          userJid = rawId;
-        }
+          /*
+           * fallback
+           */
+          if (
+            userJid?.endsWith(
+              '@lid'
+            )
+          ) {
 
-        /*
-         * Fallback للـ LID
-         */
+            userJid =
+              rawId;
+          }
 
-        if (
-          userJid?.endsWith('@lid')
-        ) {
-          userJid = rawId;
-        }
 
-        const userNumber =
-          userJid.split('@')[0];
+          const userNumber =
+            String(userJid)
+              .split('@')[0];
 
-        const gpname =
-          meta.subject;
 
-        const member =
-          meta.participants.length;
+          const gpname =
+            meta.subject;
 
-        const time =
-          moment
-            .tz('Asia/Jakarta')
-            .format('HH:mm:ss');
 
-        /* ══════════════════════════════════════
-           PROFILE PICTURE
-        ══════════════════════════════════════ */
+          const member =
+            meta.participants
+              .length;
 
-        let pp =
-          global.icon;
 
-        try {
-
-          pp =
-            await this.profilePictureUrl(
-              userJid,
-              'image'
-            );
-
-        } catch {}
-
-        /* ══════════════════════════════════════
-           DEFAULT MESSAGE
-        ══════════════════════════════════════ */
-
-        const defaultText =
-          action === 'add'
-
-            ? `┌─⭓「 *WELCOME* 」\n│ *User:* @user\n│ *Group:* ${gpname}\n│ *Member:* ${member}\n│ *Waktu:* ${time}\n└───────────────⭓\nSelamat datang!`
-
-            : `┌─⭓「 *GOODBYE* 」\n│ *User:* @user\n│ *Group:* ${gpname}\n│ *Member:* ${member}\n│ *Waktu:* ${time}\n└───────────────⭓\nSampai jumpa!`;
-
-        let text =
-          action === 'add'
-            ? (
-                chat.sWelcome ||
-                defaultText
+          const time =
+            moment
+              .tz(
+                'Asia/Jakarta'
               )
-            : (
-                chat.sBye ||
-                defaultText
+              .format(
+                'HH:mm:ss'
               );
 
-        /* ══════════════════════════════════════
-           PLACEHOLDERS
-        ══════════════════════════════════════ */
 
-        text =
-          text
+          let pp =
+            global.icon;
 
-            .replace(
-              /@user/gi,
-              `@${userNumber}`
+
+          try {
+
+            pp =
+              await this.profilePictureUrl(
+                userJid,
+                'image'
+              );
+
+          } catch {}
+
+
+          const defaultText =
+            action === 'add'
+
+              ? `┌─⭓「 *WELCOME* 」
+│ *User:* @user
+│ *Group:* ${gpname}
+│ *Member:* ${member}
+│ *Waktu:* ${time}
+└───────────────⭓
+Selamat datang!`
+
+              : `┌─⭓「 *GOODBYE* 」
+│ *User:* @user
+│ *Group:* ${gpname}
+│ *Member:* ${member}
+│ *Waktu:* ${time}
+└───────────────⭓
+Sampai jumpa!`;
+
+
+          let text =
+            action === 'add'
+              ? (
+                  chat.sWelcome ||
+                  defaultText
+                )
+              : (
+                  chat.sBye ||
+                  defaultText
+                );
+
+
+          text =
+            text
+              .replace(
+                /@user/gi,
+                `@${userNumber}`
+              )
+              .replace(
+                /@group/gi,
+                gpname
+              )
+              .replace(
+                /@member/gi,
+                String(member)
+              )
+              .replace(
+                /@waktu/gi,
+                time
+              )
+              .replace(
+                /@desc/gi,
+                meta.desc ||
+                '-'
+              );
+
+
+          await this.sendMessage(
+            id,
+            {
+              text,
+
+              mentions: [
+                userJid
+              ],
+
+              contextInfo: {
+
+                mentionedJid: [
+                  userJid
+                ],
+
+                externalAdReply: {
+
+                  title:
+                    action === 'add'
+                      ? 'Welcome notification!'
+                      : 'Goodbye, notification!',
+
+                  body:
+                    global.wm,
+
+                  thumbnailUrl:
+                    pp,
+
+                  mediaType: 1,
+
+                  renderLargerThumbnail:
+                    true,
+                },
+              },
+            }
+          );
+
+
+        } catch (e) {
+
+          console.error(
+            '[Participants Message ERROR]',
+            e
+          );
+        }
+      }
+
+      break;
+    }
+
+
+    /* ═══════════════════════════
+       PROMOTE / DEMOTE
+    ═══════════════════════════ */
+
+    case 'promote':
+    case 'demote': {
+
+      if (
+        chat.detect === false
+      ) {
+        break;
+      }
+
+
+      const rawUser =
+        participants?.[0];
+
+
+      const userJid =
+        this.getJid
+          ? this.getJid(
+              rawUser
             )
-
-            .replace(
-              /@group/gi,
-              gpname
-            )
-
-            .replace(
-              /@member/gi,
-              String(member)
-            )
-
-            .replace(
-              /@waktu/gi,
-              time
-            )
-
-            .replace(
-              /@desc/gi,
-              meta.desc || '-'
+          : this.decodeJid(
+              rawUser
             );
 
-        /* ══════════════════════════════════════
-           SEND WELCOME / BYE
-        ══════════════════════════════════════ */
+
+      const userNumber =
+        String(userJid)
+          .split('@')[0];
+
+
+      const text =
+        action === 'promote'
+
+          ? (
+              chat.sPromote ||
+              `@${userNumber} الآن أصبح Admin`
+            )
+
+          : (
+              chat.sDemote ||
+              `@${userNumber} لم يعد Admin`
+            );
+
+
+      try {
 
         await this.sendMessage(
           id,
@@ -1303,96 +2281,26 @@ export async function participantsUpdate({
             mentions: [
               userJid
             ],
-
-            contextInfo: {
-
-              mentionedJid: [
-                userJid
-              ],
-
-              externalAdReply: {
-
-                title:
-                  action === 'add'
-                    ? 'Welcome notification!'
-                    : 'Goodbye, notification!',
-
-                body:
-                  global.wm,
-
-                thumbnailUrl:
-                  pp,
-
-                mediaType: 1,
-
-                renderLargerThumbnail:
-                  true,
-              },
-            },
           }
+        );
+
+      } catch (e) {
+
+        console.error(
+          '[Promote/Demote ERROR]',
+          e
         );
       }
 
-      break;
-    }
-
-    /* ══════════════════════════════════════
-       PROMOTE / DEMOTE
-    ══════════════════════════════════════ */
-
-    case 'promote':
-    case 'demote': {
-
-      if (chat.detect === false) {
-        break;
-      }
-
-      const user =
-        participants[0];
-
-      const rawId =
-        user?.phoneNumber ||
-        user?.id ||
-        user;
-
-      const userJid =
-        this.getJid
-          ? this.getJid(rawId)
-          : this.decodeJid(rawId);
-
-      const userNumber =
-        userJid.split('@')[0];
-
-      const text =
-        action === 'promote'
-
-          ? (
-              chat.sPromote ||
-              `@${userNumber} sekarang menjadi Admin`
-            )
-
-          : (
-              chat.sDemote ||
-              `@${userNumber} tidak lagi Admin`
-            );
-
-      await this.sendMessage(
-        id,
-        {
-          text,
-          mentions: [
-            userJid
-          ],
-        }
-      );
 
       break;
     }
   }
 }
 
+
 /* ══════════════════════════════════════
-   DFAIL
+   GLOBAL DFAIL
 ══════════════════════════════════════ */
 
 global.dfail = async (
@@ -1404,42 +2312,69 @@ global.dfail = async (
   const msgs = {
 
     owner:
-      `┌─⭓「 *OWNER ONLY* 」\n│ Fitur ini hanya untuk Owner!\n└───────────────⭓`,
+      `┌─⭓「 *OWNER ONLY* 」
+│ Fitur ini hanya untuk Owner!
+└───────────────⭓`,
 
     rowner:
-      `┌─⭓「 *REAL OWNER ONLY* 」\n│ Fitur ini hanya untuk Real Owner!\n└───────────────⭓`,
+      `┌─⭓「 *REAL OWNER ONLY* 」
+│ Fitur ini hanya untuk Real Owner!
+└───────────────⭓`,
 
     mods:
-      `┌─⭓「 *MODERATOR ONLY* 」\n│ Fitur ini hanya untuk Moderator bot!\n└───────────────⭓`,
+      `┌─⭓「 *MODERATOR ONLY* 」
+│ Fitur ini hanya untuk Moderator bot!
+└───────────────⭓`,
 
     premium:
-      `┌─⭓「 *PREMIUM ONLY* 」\n│ Fitur ini hanya untuk pengguna Premium!\n└───────────────⭓`,
+      `┌─⭓「 *PREMIUM ONLY* 」
+│ Fitur ini hanya untuk pengguna Premium!
+└───────────────⭓`,
 
     group:
-      `┌─⭓「 *GROUP ONLY* 」\n│ Fitur ini hanya bisa digunakan di Group!\n└───────────────⭓`,
+      `┌─⭓「 *GROUP ONLY* 」
+│ Fitur ini hanya bisa digunakan di Group!
+└───────────────⭓`,
 
     private:
-      `┌─⭓「 *PRIVATE ONLY* 」\n│ Fitur ini hanya bisa digunakan di Private!\n└───────────────⭓`,
+      `┌─⭓「 *PRIVATE ONLY* 」
+│ Fitur ini hanya bisa digunakan di Private!
+└───────────────⭓`,
 
     admin:
-      `┌─⭓「 *ADMIN ONLY* 」\n│ Fitur ini hanya untuk Admin group!\n└───────────────⭓`,
+      `┌─⭓「 *ADMIN ONLY* 」
+│ Fitur ini hanya untuk Admin group!
+└───────────────⭓`,
 
     botAdmin:
-      `┌─⭓「 *BOT BUKAN ADMIN* 」\n│ Jadikan bot Admin terlebih dahulu!\n└───────────────⭓`,
+      `┌─⭓「 *BOT BUKAN ADMIN* 」
+│ Jadikan bot Admin terlebih dahulu!
+└───────────────⭓`,
 
     block:
-      `┌─⭓「 *COMMAND DIBLOKIR* 」\n│ Command ini telah diblokir!\n└───────────────⭓`,
+      `┌─⭓「 *COMMAND DIBLOKIR* 」
+│ Command ini telah diblokir!
+└───────────────⭓`,
 
     unreg:
-      `┌─⭓「 *BELUM DAFTAR* 」\n│ Ketik *.daftar nama.umur* untuk mendaftar!\n└───────────────⭓`,
+      `┌─⭓「 *BELUM DAFTAR* 」
+│ Ketik *.daftar nama.umur* untuk mendaftar!
+└───────────────⭓`,
   };
 
-  if (msgs[type]) {
 
-    return conn.sendMessage(
+  if (!msgs[type]) {
+    return;
+  }
+
+
+  try {
+
+    return await conn.sendMessage(
+
       m.chat,
-      {
 
+      {
         text:
           msgs[type],
 
@@ -1467,6 +2402,13 @@ global.dfail = async (
       {
         quoted: m
       }
+    );
+
+  } catch (e) {
+
+    console.error(
+      '[DFAIL ERROR]',
+      e
     );
   }
 };
