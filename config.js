@@ -5,9 +5,9 @@ import moment from 'moment-timezone';
 ────────────────────────────────────────*/
 
 // ─── OWNER ────────────────────────────
-global.owner      = ['628xxx'];          // nomor owner (tanpa +)
+global.owner      = ['212697516526'];          // nomor owner (tanpa +)
 global.nameowner  = 'KennDev';
-global.nomorown   = '628xxx';
+global.nomorown   = '212697516526';
 
 // ─── BOT ──────────────────────────────
 global.namebot    = 'ayanaMD';
