@@ -27,8 +27,8 @@ global.sgc        = 'https://chat.whatsapp.com/xxxx';
 global.thumb      = 'https://cdn.alfisy.my.id/direct/236249.jpeg';
 
 // ─── PESAN SISTEM ─────────────────────
-global.wait       = '*⏳ Loading…* Mohon tunggu sebentar';
-global.eror       = '*❌ Error System*';
+global.wait       = '> *_جاري التحميل●●●○○ 🖤 WAIT🩶_*';
+global.eror       = '*❌ خطأ*';
 global.done       = `*✅ Berhasil*\n> © ayanaMD by KennDev`;
 global.maxwarn    = 3;
 
