@@ -1,3 +1,18 @@
+/*
+ * handler.js
+ * AYANA MD
+ *
+ * Compatible with:
+ * @whiskeysockets/baileys
+ * lib/whatsapp.js
+ *
+ * IMPORTANT:
+ * - يحافظ على @lid
+ * - لا يحول @lid بالقوة إلى @s.whatsapp.net
+ * - يعتمد على lib/whatsapp.js في JID / quoted / presence
+ * - لا يوجد LIMIT HABIS
+ */
+
 import {
   getAggregateVotesInPollMessage,
   proto,
@@ -6,6 +21,19 @@ import {
   jidNormalizedUser,
   WAMessageStubType,
 } from '@whiskeysockets/baileys'
+
+import {
+  getRealJid,
+  sameJid,
+  normalizeQuoted,
+  keepOnline,
+  markRead,
+  findParticipant,
+  findBotParticipant,
+  isAdmin as isParticipantAdmin,
+  isSuperAdmin,
+  isBotAdmin as isBotAdminHelper,
+} from './lib/whatsapp.js'
 
 import { smsg } from './lib/serialize.js'
 import initDatabase from './lib/database.js'
@@ -16,12 +44,21 @@ import fs from 'fs'
 import util from 'util'
 import chalk from 'chalk'
 
-const isNumber = (x) =>
+
+/* ══════════════════════════════════════
+   BASIC HELPERS
+══════════════════════════════════════ */
+
+const isNumber = x =>
   typeof x === 'number' && !isNaN(x)
 
-const delay = (ms) =>
+
+const delay = ms =>
   isNumber(ms) &&
-  new Promise(resolve => setTimeout(resolve, ms))
+  new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  )
 
 
 /* ══════════════════════════════════════
@@ -29,166 +66,259 @@ const delay = (ms) =>
 ══════════════════════════════════════ */
 
 function getErrorText(error) {
-  if (error == null) return 'Unknown error'
 
-  if (typeof error === 'string') {
+  if (error == null)
+    return 'Unknown error'
+
+
+  if (typeof error === 'string')
     return error
-  }
+
 
   if (error instanceof Error) {
-    return error.stack || error.message || String(error)
+
+    return (
+      error.stack ||
+      error.message ||
+      String(error)
+    )
   }
 
+
   try {
+
     return util.format(error)
+
   } catch {
+
     return String(error)
+
   }
 }
 
 
 /* ══════════════════════════════════════
-   GET REAL JID
+   JID HELPERS
 ══════════════════════════════════════ */
 
-function getRealJid(conn, jid) {
-  if (!jid) return jid
+/*
+ * نستخدم getRealJid من lib/whatsapp.js.
+ *
+ * هذا مهم جدًا لأن:
+ *
+ * 123456@lid
+ *
+ * يبقى:
+ *
+ * 123456@lid
+ *
+ * ولا يتم تحويله بالقوة إلى:
+ *
+ * 123456@s.whatsapp.net
+ */
 
-  try {
-    if (conn?.getJid) {
-      const result = conn.getJid(jid)
+function resolveJid(conn, jid) {
 
-      if (result && typeof result === 'string') {
-        return result
-      }
-    }
-  } catch {}
+  if (!jid)
+    return jid
 
-  try {
-    if (conn?.decodeJid) {
-      return conn.decodeJid(jid)
-    }
-  } catch {}
-
-  return jid
+  return getRealJid(
+    conn,
+    jid
+  )
 }
 
 
-/* ══════════════════════════════════════
-   MEDIA / QUOTED NORMALIZER
-══════════════════════════════════════ */
+/*
+ * مقارنة آمنة للـ JID.
+ *
+ * بالنسبة إلى @lid:
+ * sameJid من whatsapp.js يتعامل معه
+ * بدون تحويله إلى s.whatsapp.net.
+ */
 
-function normalizeQuoted(m) {
+function jidMatches(
+  conn,
+  a,
+  b
+) {
+
+  if (!a || !b)
+    return false
+
+  if (a === b)
+    return true
+
   try {
-    if (!m) return m
 
-    const q = m.quoted
-
-    if (!q) return m
-
-    /*
-      بعض إصدارات Baileys تضع الميديا هنا:
-      q.msg.mimetype
-
-      وبعضها:
-      q.mimetype
-
-      وبعض الرسائل الجديدة:
-      q.message.videoMessage.mimetype
-      q.message.audioMessage.mimetype
-    */
-
-    let mime =
-      q.mimetype ||
-      q.msg?.mimetype ||
-      q.message?.imageMessage?.mimetype ||
-      q.message?.videoMessage?.mimetype ||
-      q.message?.audioMessage?.mimetype ||
-      q.message?.documentMessage?.mimetype ||
-      q.message?.stickerMessage?.mimetype ||
-      q.message?.documentWithCaptionMessage?.message?.documentMessage?.mimetype ||
-      ''
-
-    if (mime) {
-      q.mimetype = mime
-
-      if (q.msg && !q.msg.mimetype) {
-        q.msg.mimetype = mime
-      }
-    }
-
-    /*
-      نوع الرسالة
-    */
-
-    if (!q.mtype) {
-      if (q.message?.audioMessage) {
-        q.mtype = 'audioMessage'
-      } else if (q.message?.videoMessage) {
-        q.mtype = 'videoMessage'
-      } else if (q.message?.imageMessage) {
-        q.mtype = 'imageMessage'
-      } else if (q.message?.documentMessage) {
-        q.mtype = 'documentMessage'
-      } else if (q.message?.stickerMessage) {
-        q.mtype = 'stickerMessage'
-      }
-    }
-
-    /*
-      إذا كانت الميديا موجودة داخل q.message
-      اجعل q.msg يشير إليها أيضاً.
-    */
-
-    if (!q.msg && q.message) {
-      q.msg =
-        q.message.audioMessage ||
-        q.message.videoMessage ||
-        q.message.imageMessage ||
-        q.message.documentMessage ||
-        q.message.stickerMessage ||
-        q.message.documentWithCaptionMessage?.message?.documentMessage ||
-        null
-    }
-
-    /*
-      إصلاح download في بعض الحالات
-    */
-
-    if (
-      typeof q.download !== 'function' &&
-      typeof m.downloadQuoted === 'function'
-    ) {
-      q.download = (...args) =>
-        m.downloadQuoted(...args)
-    }
-
-    /*
-      إذا كان المقتبس Audio/Video
-      نتأكد من mimetype مرة أخرى
-    */
-
-    if (
-      !q.mimetype &&
-      (
-        q.mtype === 'audioMessage' ||
-        q.mtype === 'videoMessage'
-      )
-    ) {
-      q.mimetype =
-        q.msg?.mimetype ||
-        mime ||
-        ''
-    }
-
-    return m
-  } catch (e) {
-    console.error(
-      chalk.yellow('[Quoted Normalize Error]'),
-      e
+    return sameJid(
+      conn,
+      a,
+      b
     )
 
+  } catch {
+
+    return (
+      String(a) ===
+      String(b)
+    )
+
+  }
+}
+
+
+/* ══════════════════════════════════════
+   OWNER JID HELPERS
+══════════════════════════════════════ */
+
+function getOwnerJids(conn) {
+
+  const result = []
+
+
+  /*
+   * Bot account
+   */
+
+  const botIds = [
+
+    conn?.user?.id,
+    conn?.user?.lid,
+    conn?.user?.jid
+
+  ].filter(Boolean)
+
+
+  for (const jid of botIds) {
+
+    result.push(jid)
+
+    try {
+
+      const resolved =
+        resolveJid(
+          conn,
+          jid
+        )
+
+      if (resolved)
+        result.push(resolved)
+
+    } catch {}
+  }
+
+
+  /*
+   * global.owner
+   */
+
+  const owners =
+    Array.isArray(global.owner)
+      ? global.owner
+      : []
+
+
+  for (const owner of owners) {
+
+    const raw =
+      Array.isArray(owner)
+        ? owner[0]
+        : owner
+
+
+    if (!raw)
+      continue
+
+
+    const number =
+      String(raw)
+        .replace(
+          /[^0-9]/g,
+          ''
+        )
+
+
+    if (!number)
+      continue
+
+
+    /*
+     * نحتفظ بالصيغة التقليدية
+     */
+
+    result.push(
+      number +
+      '@s.whatsapp.net'
+    )
+
+
+    /*
+     * ونحتفظ أيضًا بـ @lid
+     * في حال كانت قاعدة الاتصال تستخدم LID.
+     */
+
+    result.push(
+      number +
+      '@lid'
+    )
+  }
+
+
+  return [
+    ...new Set(
+      result.filter(Boolean)
+    )
+  ]
+}
+
+
+function isOwnerJid(
+  conn,
+  jid
+) {
+
+  if (!jid)
+    return false
+
+
+  const owners =
+    getOwnerJids(conn)
+
+
+  return owners.some(
+    owner =>
+      jidMatches(
+        conn,
+        owner,
+        jid
+      )
+  )
+}
+
+
+/* ══════════════════════════════════════
+   MEDIA / QUOTED
+══════════════════════════════════════ */
+
+/*
+ * normalizeQuoted موجودة أصلًا في
+ * lib/whatsapp.js.
+ *
+ * هذه wrapper فقط حتى لا نحتاج
+ * تعديل باقي الكود.
+ */
+
+function normalizeMessageQuoted(m) {
+
+  try {
+
+    return normalizeQuoted(m)
+
+  } catch {
+
     return m
+
   }
 }
 
@@ -197,15 +327,47 @@ function normalizeQuoted(m) {
    KEEP BOT AVAILABLE
 ══════════════════════════════════════ */
 
-async function keepOnline(conn, chat) {
+async function keepBotOnline(
+  conn,
+  chat
+) {
+
   try {
-    if (typeof conn.sendPresenceUpdate === 'function') {
-      await conn.sendPresenceUpdate(
-        'available',
-        chat || undefined
-      )
-    }
-  } catch {}
+
+    return await keepOnline(
+      conn,
+      chat || undefined
+    )
+
+  } catch {
+
+    return false
+
+  }
+}
+
+
+/* ══════════════════════════════════════
+   READ MESSAGE
+══════════════════════════════════════ */
+
+async function readMessage(
+  conn,
+  key
+) {
+
+  try {
+
+    return await markRead(
+      conn,
+      key
+    )
+
+  } catch {
+
+    return false
+
+  }
 }
 
 
@@ -213,193 +375,257 @@ async function keepOnline(conn, chat) {
    MAIN HANDLER
 ══════════════════════════════════════ */
 
-export async function handler(chatUpdate) {
+export async function handler(
+  chatUpdate
+) {
 
-  if (global.db.data == null) {
+  if (
+    global.db.data == null
+  ) {
+
     await global.loadDatabase()
+
   }
 
-  this.msgqueque = this.msgqueque || []
 
-  if (!chatUpdate) return
+  this.msgqueque =
+    this.msgqueque || []
 
-  if (!chatUpdate.messages?.length) return
 
-  /*
-    Push messages to store
-  */
+  if (!chatUpdate)
+    return
+
+
+  if (
+    !chatUpdate.messages?.length
+  ) {
+    return
+  }
+
+
+  /* ══════════════════════════════════
+     PUSH MESSAGE TO STORE
+  ══════════════════════════════════ */
 
   try {
-    await this.pushMessage(chatUpdate.messages)
+
+    await this.pushMessage(
+      chatUpdate.messages
+    )
+
   } catch (e) {
+
     console.error(
-      chalk.yellow('[PushMessage Error]'),
+      chalk.yellow(
+        '[PushMessage Error]'
+      ),
       e
     )
   }
+
 
   let m =
     chatUpdate.messages[
       chatUpdate.messages.length - 1
     ]
 
-  if (!m) return
+
+  if (!m)
+    return
+
+
+  /* ══════════════════════════════════
+     IGNORE BOT MESSAGES
+  ══════════════════════════════════ */
+
+  if (
+    m.key?.fromMe
+  ) {
+    return
+  }
+
+
+  if (!m.message)
+    return
+
 
   /*
-    Ignore bot own messages
-  */
+   * Protocol / reaction noise
+   */
 
-  if (m.key?.fromMe) return
+  if (
+    m.message.protocolMessage
+  ) {
+    return
+  }
 
-  if (!m.message) return
 
-  /*
-    Protocol noise
-  */
+  if (
+    m.message.reactionMessage
+  ) {
+    return
+  }
 
-  if (m.message.protocolMessage) return
-
-  if (m.message.reactionMessage) return
 
   try {
 
-    /*
-      Serialize
-    */
+    /* ════════════════════════════════
+       SERIALIZE
+    ════════════════════════════════ */
 
-    m = smsg(this, m) || m
+    m =
+      smsg(
+        this,
+        m
+      ) || m
 
-    if (!m) return
 
-    /*
-      IMPORTANT:
-      Normalize quoted media BEFORE plugins
-    */
+    if (!m)
+      return
 
-    normalizeQuoted(m)
 
-    /*
-      Always try to stay online
-    */
+    /* ════════════════════════════════
+       NORMALIZE QUOTED
+    ════════════════════════════════ */
 
-    await keepOnline(this, m.chat)
+    normalizeMessageQuoted(m)
 
-    /*
-      Basic values
-    */
+
+    /* ════════════════════════════════
+       KEEP ONLINE
+    ════════════════════════════════ */
+
+    await keepBotOnline(
+      this,
+      m.chat
+    )
+
+
+    /* ════════════════════════════════
+       BASIC VALUES
+    ════════════════════════════════ */
 
     m.exp = 0
 
     /*
-      لا يوجد Limit message بعد الآن
-    */
+     * Limit disabled.
+     */
 
     m.limit = false
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        DATABASE
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     try {
+
       initDatabase(m)
+
     } catch (e) {
+
       console.error(
-        chalk.yellow('[Database Error]'),
+        chalk.yellow(
+          '[Database Error]'
+        ),
         e
       )
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        SENDER
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
-    let senderJid =
-      m.sender?.endsWith('@lid')
-        ? getRealJid(this, m.sender)
-        : getRealJid(this, m.sender)
-
-    senderJid =
-      senderJid ||
+    const rawSender =
       m.sender ||
       m.key?.participant ||
       m.key?.remoteJid
 
 
-    /* ══════════════════════════════════
-       MAKE USER OBJECT FIRST
-    ══════════════════════════════════ */
+    /*
+     * IMPORTANT:
+     * لا نستخدم:
+     *
+     * number + '@s.whatsapp.net'
+     *
+     * هنا.
+     *
+     * نترك @lid محفوظًا.
+     */
 
-    if (!global.db.data.users[senderJid]) {
+    let senderJid =
+      resolveJid(
+        this,
+        rawSender
+      )
 
-      global.db.data.users[senderJid] = {
+
+    senderJid =
+      senderJid ||
+      rawSender ||
+      m.key?.participant ||
+      m.key?.remoteJid
+
+
+    if (!senderJid)
+      return
+
+
+    /* ════════════════════════════════
+       USER OBJECT
+    ════════════════════════════════ */
+
+    if (
+      !global.db.data.users[
+        senderJid
+      ]
+    ) {
+
+      global.db.data.users[
+        senderJid
+      ] = {
+
         exp: 0,
         limit: 0,
+
         premium: false,
         premiumDate: null,
+
         moderator: false,
         banned: false,
+
         online: 0,
         chat: 0,
+
         registered: false,
         registeredTime: 0,
+
         level: 0,
+
       }
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        OWNER
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
-    const ownerJids = [
-      getRealJid(
-        this,
-        global.conn?.user?.id || this.user?.id
-      ),
-
-      ...(
-        Array.isArray(global.owner)
-          ? global.owner
-          : []
-      ).map(a => {
-
-        const num =
-          Array.isArray(a)
-            ? a[0]
-            : a
-
-        return (
-          String(num)
-            .replace(/[^0-9]/g, '')
-          + '@s.whatsapp.net'
-        )
-      }),
-
-      ...(
-        Array.isArray(global.owner)
-          ? global.owner
-          : []
-      ).map(a => {
-
-        const num =
-          Array.isArray(a)
-            ? a[0]
-            : a
-
-        return (
-          String(num)
-            .replace(/[^0-9]/g, '')
-          + '@lid'
-        )
-      }),
-    ].filter(Boolean)
+    const ownerJids =
+      getOwnerJids(
+        this
+      )
 
 
     const isROwner =
-      ownerJids.includes(senderJid) ||
-      ownerJids.includes(m.sender) ||
+      isOwnerJid(
+        this,
+        senderJid
+      ) ||
+      isOwnerJid(
+        this,
+        m.sender
+      ) ||
       m.fromMe === true
 
 
@@ -409,44 +635,69 @@ export async function handler(chatUpdate) {
 
 
     const isMods =
-      global.db.data.users[senderJid]?.moderator ||
-      false
+      Boolean(
+        global.db.data.users[
+          senderJid
+        ]?.moderator
+      )
 
 
     const isPrems =
-      global.db.data.users[senderJid]?.premium ||
-      false
+      Boolean(
+        global.db.data.users[
+          senderJid
+        ]?.premium
+      )
 
 
     const isBans =
-      global.db.data.users[senderJid]?.banned ||
-      false
+      Boolean(
+        global.db.data.users[
+          senderJid
+        ]?.banned
+      )
 
 
     const isWhitelist =
-      global.db.data.chats[m.chat]?.whitelist ||
-      false
+      Boolean(
+        global.db.data.chats[
+          m.chat
+        ]?.whitelist
+      )
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        AUTO OWNER PERMISSION
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     if (isROwner) {
 
-      global.db.data.users[senderJid].premium =
-        true
+      global.db.data.users[
+        senderJid
+      ].premium = true
 
-      global.db.data.users[senderJid].premiumDate =
+
+      global.db.data.users[
+        senderJid
+      ].premiumDate =
         'PERMANENT'
 
-      global.db.data.users[senderJid].limit =
+
+      global.db.data.users[
+        senderJid
+      ].limit =
         'PERMANENT'
 
-      global.db.data.users[senderJid].moderator =
-        true
+
+      global.db.data.users[
+        senderJid
+      ].moderator = true
     }
 
+
+    /* ════════════════════════════════
+       BAN
+    ════════════════════════════════ */
 
     if (
       isBans &&
@@ -456,44 +707,67 @@ export async function handler(chatUpdate) {
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        GROUP METADATA
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     if (m.isGroup) {
 
       try {
 
         const meta =
-          await this.groupMetadata(m.chat)
-
-        if (
-          !global.db.data.chats[m.chat]
-        ) {
-          global.db.data.chats[m.chat] = {}
-        }
-
-        const members =
-          meta.participants.map(
-            a => a.id
+          await this.groupMetadata(
+            m.chat
           )
 
-        global.db.data.chats[m.chat].member =
+
+        if (
+          !global.db.data.chats[
+            m.chat
+          ]
+        ) {
+
+          global.db.data.chats[
+            m.chat
+          ] = {}
+
+        }
+
+
+        const members =
+          Array.isArray(
+            meta?.participants
+          )
+            ? meta.participants.map(
+                a =>
+                  a?.id ||
+                  a?.phoneNumber
+              ).filter(Boolean)
+            : []
+
+
+        global.db.data.chats[
+          m.chat
+        ].member =
           members
 
-        global.db.data.chats[m.chat].chat =
+
+        global.db.data.chats[
+          m.chat
+        ].chat =
           (
-            global.db.data.chats[m.chat].chat ||
-            0
+            global.db.data.chats[
+              m.chat
+            ].chat || 0
           ) + 1
 
       } catch {}
     }
 
 
-    /* ══════════════════════════════════
-       GUARDS
-    ══════════════════════════════════ */
+    /* ════════════════════════════════
+       GLOBAL GUARDS
+    ════════════════════════════════ */
 
     if (
       global.selfMode &&
@@ -515,9 +789,9 @@ export async function handler(chatUpdate) {
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        QUEUE
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     if (
       global.opts?.queque &&
@@ -528,22 +802,37 @@ export async function handler(chatUpdate) {
       const queue =
         this.msgqueque
 
-      const prev =
-        queue[queue.length - 1]
 
-      queue.push(
+      const prev =
+        queue[
+          queue.length - 1
+        ]
+
+
+      const messageId =
         m.id ||
         m.key?.id
+
+
+      queue.push(
+        messageId
       )
+
 
       const t =
         setInterval(
           async () => {
 
-            if (!queue.includes(prev)) {
+            if (
+              !queue.includes(prev)
+            ) {
+
               clearInterval(t)
+
             } else {
+
               await delay(5000)
+
             }
 
           },
@@ -552,12 +841,14 @@ export async function handler(chatUpdate) {
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        USER STATS
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     const userData =
-      global.db.data.users[senderJid]
+      global.db.data.users[
+        senderJid
+      ]
 
 
     userData.online =
@@ -565,42 +856,43 @@ export async function handler(chatUpdate) {
 
 
     userData.chat =
-      (userData.chat || 0) + 1
+      (
+        userData.chat || 0
+      ) + 1
 
 
-    /* ══════════════════════════════════
-       ALWAYS READ
-    ══════════════════════════════════ */
+    /* ════════════════════════════════
+       READ MESSAGE
+    ════════════════════════════════ */
 
     try {
 
-      /*
-        لا نعتمد على opts.autoread.
-        إذا كانت الرسالة موجودة، نحاول جعلها مقروءة
-        في الخاص والمجموعة.
-      */
-
       if (
-        typeof this.readMessages === 'function' &&
+        typeof this.readMessages ===
+          'function' &&
         m.key
       ) {
-        await this.readMessages([
+
+        await readMessage(
+          this,
           m.key
-        ])
+        )
       }
 
     } catch (e) {
 
       console.error(
-        chalk.yellow('[Read Error]'),
+        chalk.yellow(
+          '[Read Error]'
+        ),
         e
       )
     }
 
 
-    /*
-      لا توقف البوت بسبب nyimak
-    */
+    /* ════════════════════════════════
+       NYIMAK
+    ════════════════════════════════ */
 
     if (
       global.opts?.nyimak
@@ -609,17 +901,26 @@ export async function handler(chatUpdate) {
     }
 
 
+    /* ════════════════════════════════
+       TEXT
+    ════════════════════════════════ */
+
     if (
       typeof m.text !== 'string'
     ) {
+
       m.text = ''
+
     }
 
 
-    if (m.isBaileys) {
+    if (m.isBaileys)
       return
-    }
 
+
+    /* ════════════════════════════════
+       EXP
+    ════════════════════════════════ */
 
     m.exp +=
       Math.ceil(
@@ -627,28 +928,38 @@ export async function handler(chatUpdate) {
       )
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        PLUGIN PREPARATION
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     let usedPrefix
 
+
     const _user =
-      global.db.data.users[senderJid]
+      global.db.data.users[
+        senderJid
+      ]
 
 
     let groupMetadata = {}
+
 
     if (m.isGroup) {
 
       groupMetadata =
         (
-          global.store?.groupMetadata?.[m.chat]
+          global.store
+            ?.groupMetadata
+            ?.[m.chat]
         ) ||
         (
-          await this.groupMetadata(
-            m.chat
-          ).catch(() => null)
+          await this
+            .groupMetadata(
+              m.chat
+            )
+            .catch(
+              () => null
+            )
         ) ||
         {}
     }
@@ -657,128 +968,109 @@ export async function handler(chatUpdate) {
     const participants =
       m.isGroup
         ? (
-          groupMetadata.participants ||
-          []
-        )
+            groupMetadata.participants ||
+            []
+          )
         : []
 
 
+    /*
+     * userJid يحتفظ بالـ LID
+     */
+
     const userJid =
-      getRealJid(
+      resolveJid(
         this,
         m.sender
       )
 
 
-    /* ══════════════════════════════════
-       FIND USER IN GROUP
-    ══════════════════════════════════ */
+    /* ════════════════════════════════
+       FIND USER
+    ════════════════════════════════ */
 
     const user =
-      (
-        m.isGroup
-          ? participants.find(u => {
-
-              const decodedId =
-                getRealJid(
-                  this,
-                  u.id
-                )
-
-              const decodedPhone =
-                getRealJid(
-                  this,
-                  u.phoneNumber || ''
-                )
-
-              return (
-                decodedId === userJid ||
-                decodedPhone === userJid ||
-                u.id === m.sender ||
-                u.phoneNumber === m.sender
-              )
-
-            })
-          : {}
-      ) || {}
+      m.isGroup
+        ? (
+            findParticipant(
+              this,
+              participants,
+              userJid
+            ) || {}
+          )
+        : {}
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        FIND BOT
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     const bot =
-      (
-        m.isGroup
-          ? participants.find(u => {
+      m.isGroup
+        ? (
+            findBotParticipant(
+              this,
+              participants
+            ) || {}
+          )
+        : {}
 
-              const decodedId =
-                getRealJid(
-                  this,
-                  u.id
-                )
 
-              const decodedPhone =
-                getRealJid(
-                  this,
-                  u.phoneNumber || ''
-                )
-
-              const botJid =
-                getRealJid(
-                  this,
-                  this.user?.id
-                )
-
-              return (
-                decodedId === botJid ||
-                decodedPhone === botJid ||
-                u.id === this.user?.id
-              )
-
-            })
-          : {}
-      ) || {}
-
+    /* ════════════════════════════════
+       ADMIN
+    ════════════════════════════════ */
 
     const isRAdmin =
-      user?.admin === 'superadmin'
+      isSuperAdmin(
+        user
+      )
 
 
     const isAdmin =
-      isRAdmin ||
-      user?.admin === 'admin'
+      isParticipantAdmin(
+        user
+      )
 
 
     const isBotAdmin =
-      !!bot?.admin
+      isBotAdminHelper(
+        this,
+        participants
+      )
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        STORE METADATA
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     if (
       m.isGroup &&
       groupMetadata.id
     ) {
 
-      if (!global.store) {
+      if (!global.store)
         global.store = {}
-      }
 
-      if (!global.store.groupMetadata) {
+
+      if (
+        !global.store.groupMetadata
+      ) {
+
         global.store.groupMetadata = {}
+
       }
 
-      global.store.groupMetadata[m.chat] =
+
+      global.store.groupMetadata[
+        m.chat
+      ] =
         groupMetadata
     }
 
 
-    /* ══════════════════════════════════
+    /* ════════════════════════════════
        PLUGIN LOOP
-    ══════════════════════════════════ */
+    ════════════════════════════════ */
 
     for (
       const name in global.plugins
@@ -788,17 +1080,21 @@ export async function handler(chatUpdate) {
         global.plugins[name]
 
 
-      if (!plugin) continue
+      if (!plugin)
+        continue
 
-      if (plugin.disabled) continue
+
+      if (plugin.disabled)
+        continue
 
 
-      /* ════════════════════════════════
-         ALL HOOK
-      ════════════════════════════════ */
+      /* ══════════════════════════════
+         ALL
+      ══════════════════════════════ */
 
       if (
-        typeof plugin.all === 'function'
+        typeof plugin.all ===
+        'function'
       ) {
 
         try {
@@ -821,9 +1117,9 @@ export async function handler(chatUpdate) {
       }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          PREFIX
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       const str2Regex =
         str =>
@@ -851,12 +1147,19 @@ export async function handler(chatUpdate) {
 
         _prefix.lastIndex = 0
 
+
         const result =
-          _prefix.exec(m.text)
+          _prefix.exec(
+            m.text
+          )
+
 
         match =
           result
-            ? [result, _prefix]
+            ? [
+                result,
+                _prefix
+              ]
             : null
 
       } else if (
@@ -874,15 +1177,21 @@ export async function handler(chatUpdate) {
                       str2Regex(p)
                     )
 
+
               re.lastIndex = 0
 
+
               return [
-                re.exec(m.text),
+                re.exec(
+                  m.text
+                ),
                 re
               ]
 
             })
-            .find(p => p[0])
+            .find(
+              p => p[0]
+            )
 
       } else if (
         typeof _prefix === 'string'
@@ -890,30 +1199,37 @@ export async function handler(chatUpdate) {
 
         const re =
           new RegExp(
-            str2Regex(_prefix)
+            str2Regex(
+              _prefix
+            )
           )
 
+
         match = [
-          re.exec(m.text),
+          re.exec(
+            m.text
+          ),
           re
         ]
 
-        if (!match[0]) {
+
+        if (!match[0])
           match = null
-        }
 
       } else {
 
         match = null
+
       }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          BEFORE
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       if (
-        typeof plugin.before === 'function'
+        typeof plugin.before ===
+        'function'
       ) {
 
         try {
@@ -923,24 +1239,37 @@ export async function handler(chatUpdate) {
               this,
               m,
               {
+
                 match,
+
                 conn: this,
+
                 participants,
+
                 groupMetadata,
+
                 user,
+
                 bot,
+
                 isROwner,
                 isOwner,
+
                 isRAdmin,
                 isAdmin,
                 isBotAdmin,
+
                 isPrems,
                 isBans,
+
                 chatUpdate,
+
               }
             )
           ) {
+
             continue
+
           }
 
         } catch (e) {
@@ -952,16 +1281,18 @@ export async function handler(chatUpdate) {
             e
           )
 
-          /*
-            نرسل الخطأ الحقيقي
-          */
 
           try {
 
             await m.reply(
               `❌ *خطأ داخل before للـ Plugin*\n\n` +
               `*Plugin:* ${name}\n\n` +
-              `\`\`\`\n${getErrorText(e).slice(0, 3500)}\n\`\`\``
+              `\`\`\`\n` +
+              `${getErrorText(e).slice(
+                0,
+                3500
+              )}` +
+              `\n\`\`\``
             )
 
           } catch {}
@@ -969,31 +1300,42 @@ export async function handler(chatUpdate) {
       }
 
 
+      /* ══════════════════════════════
+         PLUGIN FUNCTION
+      ══════════════════════════════ */
+
       if (
-        typeof plugin !== 'function'
+        typeof plugin !==
+        'function'
       ) {
         continue
       }
 
 
-      if (!match) {
+      if (!match)
         continue
-      }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          COMMAND
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       const result =
         (
-          (global.opts?.multiprefix ?? true) &&
-          (match[0] || '')[0]
+          (
+            global.opts?.multiprefix ??
+            true
+          ) &&
+          (
+            match[0] || ''
+          )[0]
         ) ||
         (
-          (global.opts?.noprefix ?? false)
+          global.opts?.noprefix
             ? null
-            : (match[0] || '')[0]
+            : (
+                match[0] || ''
+              )[0]
         )
 
 
@@ -1019,10 +1361,13 @@ export async function handler(chatUpdate) {
         noPrefix =
           !result
             ? ''
-            : m.text.replace(
-                result,
-                ''
-              ).trim()
+            : m.text
+                .replace(
+                  result,
+                  ''
+                )
+                .trim()
+
       }
 
 
@@ -1052,8 +1397,9 @@ export async function handler(chatUpdate) {
 
 
       command =
-        (command || '')
-          .toLowerCase()
+        (
+          command || ''
+        ).toLowerCase()
 
 
       const fail =
@@ -1079,38 +1425,48 @@ export async function handler(chatUpdate) {
 
         prefixCommand.lastIndex = 0
 
+
         isAccept =
           prefixCommand.test(
             command
           )
 
       } else if (
-        Array.isArray(prefixCommand)
+        Array.isArray(
+          prefixCommand
+        )
       ) {
 
         isAccept =
-          prefixCommand.some(c => {
+          prefixCommand.some(
+            c => {
 
-            if (
-              c instanceof RegExp
-            ) {
+              if (
+                c instanceof RegExp
+              ) {
 
-              c.lastIndex = 0
+                c.lastIndex = 0
 
-              return c.test(
-                command
-              )
+                return c.test(
+                  command
+                )
+
+              }
+
+              return c === command
+
             }
-
-            return c === command
-          })
+          )
 
       } else if (
-        typeof prefixCommand === 'string'
+        typeof prefixCommand ===
+        'string'
       ) {
 
         isAccept =
-          prefixCommand === command
+          prefixCommand ===
+          command
+
       }
 
 
@@ -1124,34 +1480,38 @@ export async function handler(chatUpdate) {
           : result
 
 
-      if (!isAccept) {
+      if (!isAccept)
         continue
-      }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          COMMAND INFO
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       m.plugin =
         name
 
+
       m.chatUpdate =
         chatUpdate
 
+
       m.command =
         command
+
 
       m.isCommand =
         true
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          CHAT GUARDS
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       const chatData =
-        global.db.data.chats[m.chat]
+        global.db.data.chats[
+          m.chat
+        ]
 
 
       if (
@@ -1171,14 +1531,17 @@ export async function handler(chatUpdate) {
       }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          BLOCK COMMAND
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       if (
-        global.db.data.settings?.blockcmd?.includes(
-          command
-        )
+        global.db.data
+          .settings
+          ?.blockcmd
+          ?.includes(
+            command
+          )
       ) {
 
         await global.dfail(
@@ -1191,9 +1554,9 @@ export async function handler(chatUpdate) {
       }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          PERMISSIONS
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       if (
         plugin.rowner &&
@@ -1330,19 +1693,25 @@ export async function handler(chatUpdate) {
       }
 
 
+      /* ══════════════════════════════
+         LIMIT DISABLED
+      ══════════════════════════════ */
+
       /*
-        IMPORTANT:
-        تم حذف LIMIT HABIS بالكامل.
+       * لا يوجد هنا:
+       *
+       * if (_user.limit <= 0)
+       * if (m.limit)
+       * LIMIT HABIS
+       * _user.limit--
+       *
+       * النظام مفتوح بدون استهلاك Limit.
+       */
 
-        لا يوجد:
-        LIMIT HABIS
-        ولا يتم منع الأمر بسبب limit.
-      */
 
-
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          LEVEL
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       if (
         plugin.level &&
@@ -1360,12 +1729,17 @@ export async function handler(chatUpdate) {
       }
 
 
-      /* ════════════════════════════════
-         STAT
-      ════════════════════════════════ */
+      /* ══════════════════════════════
+         RESPONSE STATS
+      ══════════════════════════════ */
 
-      if (!global.db.data.respon) {
-        global.db.data.respon = {}
+      if (
+        !global.db.data.respon
+      ) {
+
+        global.db.data.respon =
+          {}
+
       }
 
 
@@ -1382,7 +1756,10 @@ export async function handler(chatUpdate) {
       if (stat) {
 
         stat.total =
-          (stat.total || 0) + 1
+          (
+            stat.total || 0
+          ) + 1
+
 
         stat.last =
           now
@@ -1396,15 +1773,21 @@ export async function handler(chatUpdate) {
           total: 1,
           success: 0,
           last: now,
-          lastSuccess: 0
+          lastSuccess: 0,
 
         }
       }
 
 
+      /* ══════════════════════════════
+         EXP
+      ══════════════════════════════ */
+
       const xp =
         'exp' in plugin
-          ? parseInt(plugin.exp)
+          ? parseInt(
+              plugin.exp
+            )
           : 17
 
 
@@ -1414,52 +1797,67 @@ export async function handler(chatUpdate) {
           : xp
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          EXTRA
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       const extra = {
 
         match,
+
         usedPrefix,
+
         noPrefix,
+
         _args,
+
         args,
+
         command,
+
         text,
 
         conn: this,
 
         participants,
+
         groupMetadata,
 
         user,
+
         bot,
 
         isROwner,
+
         isOwner,
+
         isRAdmin,
+
         isAdmin,
+
         isBotAdmin,
 
         isPrems,
+
         isBans,
 
         chatUpdate,
+
       }
 
 
-      /* ════════════════════════════════
+      /* ══════════════════════════════
          EXECUTE PLUGIN
-      ════════════════════════════════ */
+      ══════════════════════════════ */
 
       try {
 
         /*
-          Normalize quoted again مباشرة قبل plugin
-        */
+         * آخر normalize قبل تشغيل
+         * الـ plugin.
+         */
 
-        normalizeQuoted(m)
+        normalizeMessageQuoted(m)
 
 
         await plugin.call(
@@ -1470,13 +1868,11 @@ export async function handler(chatUpdate) {
 
 
         /*
-          لا نمنع الأوامر بسبب limit.
-        */
+         * لا يوجد Limit.
+         */
 
-        if (!isPrems) {
-          m.limit =
-            m.limit || false
-        }
+        m.limit =
+          false
 
 
         const s =
@@ -1488,7 +1884,10 @@ export async function handler(chatUpdate) {
         if (s) {
 
           s.success =
-            (s.success || 0) + 1
+            (
+              s.success || 0
+            ) + 1
+
 
           s.lastSuccess =
             now
@@ -1510,23 +1909,37 @@ export async function handler(chatUpdate) {
             '[Plugin Error]'
           ),
           {
-            plugin: m.plugin,
-            command: m.command,
-            chat: m.chat,
-            sender: m.sender,
-            error: errText
+
+            plugin:
+              m.plugin,
+
+            command:
+              m.command,
+
+            chat:
+              m.chat,
+
+            sender:
+              m.sender,
+
+            error:
+              errText,
+
           }
         )
 
 
         /* ════════════════════════════
-           SEND REAL ERROR TO USER
+           SEND ERROR TO USER
         ════════════════════════════ */
 
         try {
 
           await m.reply(
-            `${errText.slice(0, 3500)}`
+            `${errText.slice(
+              0,
+              3500
+            )}`
           )
 
         } catch (replyError) {
@@ -1541,13 +1954,15 @@ export async function handler(chatUpdate) {
 
 
         /* ════════════════════════════
-           ALSO REPORT OWNER
+           REPORT OWNER
         ════════════════════════════ */
 
         try {
 
           const owners =
-            Array.isArray(global.owner)
+            Array.isArray(
+              global.owner
+            )
               ? global.owner
               : []
 
@@ -1572,9 +1987,8 @@ export async function handler(chatUpdate) {
                   )
 
 
-              if (!cleanNumber) {
+              if (!cleanNumber)
                 continue
-              }
 
 
               const ownerJid =
@@ -1586,7 +2000,10 @@ export async function handler(chatUpdate) {
                 ownerJid,
                 {
                   text:
-                    `${errText.slice(0, 3500)}`
+                    errText.slice(
+                      0,
+                      3500
+                    )
                 }
               )
 
@@ -1604,16 +2021,15 @@ export async function handler(chatUpdate) {
         } catch {}
 
 
-        /*
-          IMPORTANT:
-          لا نرسل الرسالة القديمة:
-          [ Sistem ] Terjadi error pada bot!
-        */
-
       } finally {
 
+        /* ════════════════════════════
+           AFTER
+        ════════════════════════════ */
+
         if (
-          typeof plugin.after === 'function'
+          typeof plugin.after ===
+          'function'
         ) {
 
           try {
@@ -1655,10 +2071,9 @@ export async function handler(chatUpdate) {
     )
 
 
-    /*
-      إذا كان الخطأ من الـ Handler نفسه،
-      نحاول إرساله للمستخدم أيضاً.
-    */
+    /* ══════════════════════════════
+       HANDLER ERROR
+    ══════════════════════════════ */
 
     try {
 
@@ -1666,7 +2081,12 @@ export async function handler(chatUpdate) {
 
         await m.reply(
           `*[ HANDLER ERROR ]*\n\n` +
-          `\`\`\`\n${errorText.slice(0, 3500)}\n\`\`\``
+          `\`\`\`\n` +
+          `${errorText.slice(
+            0,
+            3500
+          )}` +
+          `\n\`\`\``
         )
       }
 
@@ -1674,15 +2094,15 @@ export async function handler(chatUpdate) {
   }
 
 
-  /* ══════════════════════════════════
+  /* ══════════════════════════════
      FINALLY
-  ══════════════════════════════════ */
+  ══════════════════════════════ */
 
   finally {
 
-    /*
-      Queue cleanup
-    */
+    /* ════════════════════════════
+       QUEUE CLEANUP
+    ════════════════════════════ */
 
     try {
 
@@ -1691,10 +2111,14 @@ export async function handler(chatUpdate) {
         m?.text
       ) {
 
+        const messageId =
+          m.id ||
+          m.key?.id
+
+
         const idx =
           this.msgqueque.indexOf(
-            m.id ||
-            m.key?.id
+            messageId
           )
 
 
@@ -1710,16 +2134,16 @@ export async function handler(chatUpdate) {
     } catch {}
 
 
-    /* ════════════════════════════════
+    /* ════════════════════════════
        EXP UPDATE
-    ════════════════════════════════ */
+    ════════════════════════════ */
 
     try {
 
       if (m) {
 
         const finalSenderJid =
-          getRealJid(
+          resolveJid(
             this,
             m.sender
           )
@@ -1734,15 +2158,17 @@ export async function handler(chatUpdate) {
         if (u) {
 
           u.exp =
-            (u.exp || 0) +
-            (m.exp || 0)
+            (
+              u.exp || 0
+            ) +
+            (
+              m.exp || 0
+            )
 
 
           /*
-            لا ننقص Limit
-            لأن نظام Limit تم تعطيله
-          */
-
+           * لا يتم إنقاص Limit.
+           */
         }
       }
 
@@ -1755,9 +2181,9 @@ export async function handler(chatUpdate) {
     }
 
 
-    /*
-      Print
-    */
+    /* ════════════════════════════
+       PRINT
+    ════════════════════════════ */
 
     try {
 
@@ -1784,7 +2210,9 @@ export async function participantsUpdate({
   if (
     global.db.data == null
   ) {
+
     await global.loadDatabase()
+
   }
 
 
@@ -1815,52 +2243,72 @@ export async function participantsUpdate({
       try {
 
         meta =
-          await this.groupMetadata(id)
+          await this.groupMetadata(
+            id
+          )
 
       } catch {
+
         return
+
       }
 
 
       for (
-        const user of participants
+        const participant of
+        participants
       ) {
 
         /*
-          Baileys الجديد:
+         * Baileys الجديد قد يعطينا:
+         *
+         * {
+         *   id: "...@lid",
+         *   phoneNumber: "...@s.whatsapp.net",
+         *   admin: null
+         * }
+         */
 
-          {
-            id: "...@lid",
-            phoneNumber: "...@s.whatsapp.net",
-            admin: null
-          }
-        */
 
         const rawId =
-          user?.phoneNumber ||
-          user?.id ||
-          user
+          participant?.id ||
+          participant?.phoneNumber ||
+          participant
 
+
+        /*
+         * أولاً نحاول الاحتفاظ بالـ id
+         * كما جاء من Baileys.
+         */
 
         let userJid =
-          getRealJid(
+          resolveJid(
             this,
             rawId
           )
 
 
         /*
-          إذا بقي LID
-        */
+         * إذا كان لدينا phoneNumber
+         * حقيقي، يمكن استخدامه فقط
+         * كـ fallback في حال تعذر
+         * الحصول على JID صالح.
+         *
+         * لكن لا نحول @lid بالقوة.
+         */
 
         if (
-          userJid?.endsWith('@lid')
+          !userJid &&
+          participant?.phoneNumber
         ) {
 
           userJid =
-            user?.phoneNumber ||
-            rawId
+            participant.phoneNumber
         }
+
+
+        if (!userJid)
+          continue
 
 
         const userNumber =
@@ -1869,17 +2317,24 @@ export async function participantsUpdate({
 
 
         const gpname =
-          meta.subject
+          meta.subject ||
+          'Group'
 
 
         const member =
-          meta.participants.length
+          Array.isArray(
+            meta.participants
+          )
+            ? meta.participants.length
+            : 0
 
 
         const time =
           moment
             .tz('Asia/Jakarta')
-            .format('HH:mm:ss')
+            .format(
+              'HH:mm:ss'
+            )
 
 
         let pp =
@@ -1958,6 +2413,7 @@ export async function participantsUpdate({
           await this.sendMessage(
             id,
             {
+
               text,
 
               mentions: [
@@ -1987,6 +2443,7 @@ export async function participantsUpdate({
 
                   renderLargerThumbnail:
                     true,
+
                 }
               }
             }
@@ -2020,21 +2477,29 @@ export async function participantsUpdate({
       }
 
 
-      const user =
-        participants[0]
+      const participant =
+        participants?.[0]
+
+
+      if (!participant)
+        break
 
 
       const rawId =
-        user?.phoneNumber ||
-        user?.id ||
-        user
+        participant?.id ||
+        participant?.phoneNumber ||
+        participant
 
 
       const userJid =
-        getRealJid(
+        resolveJid(
           this,
           rawId
         )
+
+
+      if (!userJid)
+        break
 
 
       const userNumber =
@@ -2061,11 +2526,13 @@ export async function participantsUpdate({
         await this.sendMessage(
           id,
           {
+
             text,
 
             mentions: [
               userJid
             ]
+
           }
         )
 
@@ -2145,20 +2612,22 @@ global.dfail = async (
       `┌─⭓「 *BELUM DAFTAR* 」\n` +
       `│ Ketik *.daftar nama.umur* untuk mendaftar!\n` +
       `└───────────────⭓`,
+
   }
 
 
-  if (!msgs[type]) {
+  if (!msgs[type])
     return
-  }
 
 
   try {
 
-    return await conn.sendMessage(
+    await conn.sendMessage(
       m.chat,
       {
-        text: msgs[type],
+
+        text:
+          msgs[type],
 
         contextInfo: {
 
@@ -2177,8 +2646,10 @@ global.dfail = async (
 
             renderLargerThumbnail:
               false,
+
           }
         }
+
       },
       {
         quoted: m
