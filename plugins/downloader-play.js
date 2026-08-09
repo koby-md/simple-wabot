@@ -1,49 +1,147 @@
-import yts from 'yt-search';
+import yts from 'yt-search'
+import crypto from 'crypto'
+import axios from 'axios'
 
-let handler = async (m, { conn, usedPrefix, text }) => {
-    if (!text) {
-        return conn.reply(m.chat, '> للتنزيل من يوتيب ❇️', m);
+class SaveTube {
+  constructor() {
+    this.ky = 'C5D58EF67A7584E4A29F6C35BBC4EB12'
+    this.m = /(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})/
+
+    this.is = axios.create({
+      headers: {
+        'content-type': 'application/json',
+        'origin': 'https://yt.savetube.me',
+        'user-agent': 'Mozilla/5.0'
+      }
+    })
+  }
+
+  async decrypt(enc) {
+    const buf = Buffer.from(enc, 'base64')
+    const key = Buffer.from(this.ky, 'hex')
+    const iv = buf.slice(0, 16)
+    const data = buf.slice(16)
+
+    const decipher = crypto.createDecipheriv('aes-128-cbc', key, iv)
+
+    const decrypted = Buffer.concat([
+      decipher.update(data),
+      decipher.final()
+    ])
+
+    return JSON.parse(decrypted.toString())
+  }
+
+  async getCdn() {
+    const res = await this.is.get(
+      'https://media.savetube.vip/api/random-cdn'
+    )
+
+    return res.data.cdn
+  }
+
+  async download(url) {
+    const id = url.match(this.m)?.[1]
+
+    if (!id) {
+      throw new Error('Invalid YouTube URL')
     }
 
-    try {
-        let result = await yts(text);
-        let ytres = result.videos;
+    const cdn = await this.getCdn()
 
-        if (!ytres || ytres.length === 0) {
-            return conn.reply(m.chat, 'No results found.', m);
+    const info = await this.is.post(
+      `https://${cdn}/v2/info`,
+      {
+        url: `https://www.youtube.com/watch?v=${id}`
+      }
+    )
 
-        }
+    const dec = await this.decrypt(info.data.data)
 
-        let v = ytres[0];
+    const dl = await this.is.post(
+      `https://${cdn}/download`,
+      {
+        id,
+        downloadType: 'audio',
+        quality: '128',
+        key: dec.key
+      }
+    )
 
-        // مصفوفة الأزرار
-await m.react('⏳️');
-        let buttons = [
-            { buttonId: `${usedPrefix}ytmp3 ${v.url}`, buttonText: { displayText: '🎧 Audio' }, type: 1 },
-            { buttonId: `${v.url}`, buttonText: { displayText: '🎬 Video' }, type: 1 }
-        ];
-
-        // إرسال الصورة مع العنوان والأزرار في رسالة واحدة
-        await conn.sendMessage(
-            m.chat,
-            {
-                image: { url: v.thumbnail },
-                caption: `*${v.title}*\n\n🔗 ${v.url}\n\n*_📥 إختر الوسيلة للتنزيل_*`,
-                footer: '🤍KOBY🤍',
-                buttons: buttons,
-                headerType: 4
-            },
-            { quoted: m }
-        );
-
-    } catch (e) {
-        console.log(e);
-        m.reply('حدث خطأ، يرجى المحاولة لاحقاً.');
+    return {
+      title: dec.title,
+      download: dl.data.data.downloadUrl
     }
-};
+  }
+}
 
-handler.help = ['play'];
-handler.tags = ['dl'];
-handler.command = /^play$/i;
+// منع تشغيل نفس الطلب أكثر من مرة
+const running = new Set()
 
-export default handler;
+let handler = async (m, { conn, text }) => {
+  if (!text) {
+    return conn.reply(
+      m.chat,
+      '❇️ اكتب اسم الأغنية أو رابط يوتيوب\n\nمثال:\n.play اسم الأغنية',
+      m
+    )
+  }
+
+  if (running.has(m.key.id)) return
+  running.add(m.key.id)
+
+  try {
+    await m.react('⏳')
+
+    // البحث في يوتيوب
+    const result = await yts(text)
+    const videos = result.videos
+
+    if (!videos || videos.length === 0) {
+      throw new Error('لم يتم العثور على نتائج')
+    }
+
+    // أخذ أول نتيجة
+    const video = videos[0]
+
+    await m.reply(
+      `🎵 *${video.title}*\n\n⏬ جاري تحميل الصوت...`
+    )
+
+    // التحميل من SaveTube
+    const st = new SaveTube()
+    const res = await st.download(video.url)
+
+    // إرسال MP3 مباشرة
+    await conn.sendMessage(
+      m.chat,
+      {
+        audio: { url: res.download },
+        mimetype: 'audio/mpeg',
+        fileName: `${res.title}.mp3`
+      },
+      { quoted: m }
+    )
+
+    await m.react('✅')
+
+  } catch (e) {
+    console.error(e)
+
+    await m.react('❌')
+
+    await m.reply(
+      '❌ حدث خطأ أثناء البحث أو التحميل.\n' +
+      (e.message || e)
+    )
+
+  } finally {
+    running.delete(m.key.id)
+  }
+}
+
+handler.help = ['play <اسم الأغنية>']
+handler.tags = ['downloader']
+handler.command = /^ply$/i
+
+export default handler
