@@ -1,10 +1,7 @@
 import { fbdown } from 'btch-downloader'
-import axios from 'axios'
-import fs from 'fs'
-import path from 'path'
 
 const facebookRegex =
-/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.watch|fb\.com)\/\S+/i
+  /https?:\/\/(?:www\.)?(?:facebook\.com|fb\.watch|fb\.com)\/\S+/i
 
 export async function before(m, { conn }) {
   if (!m.text) return
@@ -12,46 +9,66 @@ export async function before(m, { conn }) {
   const match = m.text.match(facebookRegex)
   if (!match) return
 
-  let filePath
-
   try {
     await m.react('⏳')
-    await m.reply (wait)
+    await m.reply(wait)
 
     const res = await fbdown(match[0])
 
+    console.log('[FB] Result:', res)
+
+    if (!res?.status) {
+      throw new Error(`fbdown failed: ${JSON.stringify(res)}`)
+    }
+
     const videoUrl = res.HD || res.Normal_video
 
-    if (!videoUrl) return
+    if (!videoUrl) {
+      throw new Error(
+        `لم يتم العثور على رابط الفيديو: ${JSON.stringify(res)}`
+      )
+    }
 
-    filePath = path.join(
-      process.cwd(),
-      `fb_${Date.now()}.mp4`
-    )
+    console.log('[FB] Video URL:', videoUrl)
 
-    const response = await axios.get(videoUrl, {
-      responseType: 'arraybuffer',
-      maxRedirects: 10
-    })
-
-    fs.writeFileSync(filePath, response.data)
-
-    await conn.sendFile(
+    await conn.sendMessage(
       m.chat,
-      filePath,
-      'facebook.mp4',
-      '🎥 Facebook Video',
-      m
+      {
+        video: {
+          url: videoUrl
+        },
+        mimetype: 'video/mp4',
+        caption: '🎥 Facebook Video'
+      },
+      {
+        quoted: m
+      }
     )
 
     await m.react('✅')
 
   } catch (e) {
-    console.error('FB ERROR:', e)
-    m.react('❌')
-  } finally {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath)
+    console.error('[FB ERROR FULL]:', e)
+
+    let errorText = `Message: ${e?.message || String(e)}`
+
+    if (e?.response) {
+      errorText += `\nHTTP Status: ${e.response.status}`
+
+      if (e.response.data) {
+        try {
+          errorText += `\nResponse: ${JSON.stringify(e.response.data)}`
+        } catch {
+          errorText += `\nResponse: ${String(e.response.data)}`
+        }
+      }
     }
+
+    console.error(errorText)
+
+    await m.react('❌')
+    await m.reply(
+      `❌ FB ERROR:\n\n${errorText}`.slice(0, 4000)
+    )
   }
 }
