@@ -142,6 +142,6 @@ let handler = async (m, { conn, text }) => {
 
 handler.help = ['play <اسم الأغنية>']
 handler.tags = ['downloader']
-handler.command = /^ply$/i
+handler.command = /^play$/i
 
 export default handler
