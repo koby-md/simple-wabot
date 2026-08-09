@@ -1586,13 +1586,7 @@ export async function handler(chatUpdate) {
                 ownerJid,
                 {
                   text:
-                    `*[ BOT ERROR ]*\n\n` +
-                    `*Plugin:* ${m.plugin}\n` +
-                    `*Command:* ${usedPrefix}${command}\n` +
-                    `*From:* ${m.sender || '-'}\n` +
-                    `*Chat:* ${m.chat || '-'}\n\n` +
-                    `*Error:*\n` +
-                    `\`\`\`\n${errText.slice(0, 3500)}\n\`\`\``
+                    `${errText.slice(0, 3500)}`
                 }
               )
 
