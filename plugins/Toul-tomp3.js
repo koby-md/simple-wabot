@@ -10,7 +10,7 @@ let handler = async (m, { conn }) => {
   const mime = q.mimetype || q.msg?.mimetype || ''
 
   if (!/audio|video/.test(mime)) {
-    throw '> *_🌼 رد على فيديو أو أوديو واستعمل الأمر tomp3 🌼_*'
+    throw '> *_🌼 رد على فيديو أو أوديو واستعمل الأمر to🌼_*'
   }
 
   const tmpDir = './src/tmp'
@@ -79,8 +79,8 @@ let handler = async (m, { conn }) => {
   }
 }
 
-handler.help = ['tomp3']
+handler.help = ['to']
 handler.tags = ['tools']
-handler.command = /^tomp3$/i
+handler.command = /^to$/i
 
 export default handler
