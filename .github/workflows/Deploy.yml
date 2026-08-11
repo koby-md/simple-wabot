@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"  # كيعاود يخدم كل 6 سوايع
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 
+
+    permissions:
+      id-token: write
+      contents: read
+      actions: write
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js 20
+        uses: actions/setup-node@v3 
+        with:
+          node-version: 20
+
+      - name: Cache node_modules
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Install System Dependencies (FFmpeg & ImageMagick)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg imagemagick libwebp-dev
+
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
+        with:
+          access_token: ${{ github.token }} 
+
+      - name: Start Project
+        timeout-minutes: 345
+        run: npm run start
